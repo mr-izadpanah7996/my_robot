@@ -5,6 +5,9 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from handlers import router
 from config import Config, load_config
+from middlewares.throttling import AntiSpamMiddleware
+from middlewares.subscription import MandatorySubMiddleware
+
 
 # ساخت لاگر مخصوص این فایل
 
@@ -36,6 +39,13 @@ async def main() -> None:
     )
 
     dp = Dispatcher()
+
+    # اتصال میدلور ها به دیسپچر
+
+    dp.message.outer_middleware(AntiSpamMiddleware(limit_seconds=1.0, cooldown_seconds=4.0))
+
+    dp.message.outer_middleware(MandatorySubMiddleware(channels=config.bot.channels))
+
 
     # تزریق شیء کانفیگ به کل جریان ربات (قابل دسترسی در همه هندلرها)
 
