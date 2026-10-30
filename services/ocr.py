@@ -31,7 +31,7 @@ class OCRService:
         "explanations, or markdown notes."
     )
 
-    def __init__(self, api_keys: list[str], model_name: str = "gemini-2.5-flash-lite") -> None:
+    def __init__(self, api_keys: list[str], model_name: str = "gemini-3.5-flash-lite") -> None:
 
         
         if not api_keys:
