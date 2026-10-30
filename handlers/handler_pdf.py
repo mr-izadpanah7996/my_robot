@@ -6,20 +6,25 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.exceptions import TelegramBadRequest
 
+from config import load_config
 from keyboards.inline import get_cancel_ocr_keyboard
-
+from services.ocr import OCRService
+from services.limiter import DailyLimiter
 from services.pdf_service import (
     PDFService,
     PDFPageLimitExceeded,
     PDFEncryptedError,
     PDFEmptyError,
 )
-from handlers.ocr import daily_limiter, ocr_service
 
-logger = logging.getLogger(name)
+logger = logging.getLogger(__name__)
 
 pdf_router = Router()
 
+# مقداردهی سرویس‌ها
+config = load_config()
+ocr_service = OCRService(api_keys=config.ai.api_keys)
+daily_limiter = DailyLimiter(max_requests=15, window_seconds=86400)
 pdf_service = PDFService(ocr_service=ocr_service, max_pages=70)
 
 
@@ -39,8 +44,6 @@ async def start_pdf_process(message: Message, state: FSMContext) -> None:
     remaining = daily_limiter.get_remaining_quota(user_id=user_id)
 
     # بررسی حداقل سهمیه لازم برای شروع فرآیند پردازش
-
-
     if remaining < 3:
         await message.answer(
             f"⚠️ سهمیه روزانه شما برای این بخش کافی نیست.\n"
@@ -63,7 +66,6 @@ async def start_pdf_process(message: Message, state: FSMContext) -> None:
 # ==========================================
 # ۳. دکمه شیشه‌ای انصراف
 # ==========================================
-
 @pdf_router.callback_query(F.data == "cancel_ocr")
 async def cancel_pdf_process(callback: CallbackQuery, state: FSMContext) -> None:
     current_state = await state.get_state()
@@ -83,24 +85,19 @@ async def cancel_pdf_process(callback: CallbackQuery, state: FSMContext) -> None
 # ==========================================
 # ۴. هندلر دریافت و پردازش فایل PDF
 # ==========================================
-
-
 @pdf_router.message(PDFState.waiting_for_pdf, F.document)
 async def process_pdf_document(message: Message, state: FSMContext, bot: Bot) -> None:
     user_id = message.from_user.id
 
     # خروج از استیت برای جلوگیری از ارسال فایل‌های مکرر در صف
-
     await state.clear()
 
     # بررسی مجدد سهمیه
-
     if daily_limiter.get_remaining_quota(user_id=user_id) < 3:
         await message.answer("⚠️ سهمیه روزانه شما برای پردازش این فایل کافی نیست.")
         return
 
     # بررسی پسوند فایل
-
     file_name = message.document.file_name or "document.pdf"
     if not file_name.lower().endswith(".pdf"):
         await message.answer(
@@ -123,11 +120,9 @@ async def process_pdf_document(message: Message, state: FSMContext, bot: Bot) ->
             pass
 
         # پردازش با متد کلاس سرویس
-
         full_text, is_scanned = await pdf_service.process_pdf(file_bytes=file_bytes)
 
-
-# مدیریت کسر سهمیه
+        # مدیریت کسر سهمیه
         if is_scanned:
             for _ in range(3):
                 daily_limiter.check_and_consume(user_id=user_id)
@@ -140,7 +135,6 @@ async def process_pdf_document(message: Message, state: FSMContext, bot: Bot) ->
             return
 
         # ارسال بر اساس حجم متن (پیام چت یا فایل .txt)
-
         if len(full_text) < 4000:
             try:
                 await status_msg.delete()
@@ -196,3 +190,4 @@ async def invalid_pdf_input(message: Message) -> None:
         reply_markup=get_cancel_ocr_keyboard()
     )
 
+    
