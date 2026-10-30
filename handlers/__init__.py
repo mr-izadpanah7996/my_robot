@@ -1,7 +1,7 @@
 from aiogram import Router
 from handlers.start import start_router
 from handlers.handler_ocr import ocr_router
-from handlers.handler_pdf import router_pdf
+from handlers.handler_pdf import pdf_router
 
 
 router = Router()
@@ -12,6 +12,6 @@ router.include_routers(
 
     ocr_router,
 
-    router_pdf
+    pdf_router
 
 )
