@@ -31,7 +31,9 @@ class OCRService:
         "explanations, or markdown notes."
     )
 
-    def __init__(self, api_keys: list[str], model_name: str = "gemini-3.8-flash") -> None:
+    def __init__(self, api_keys: list[str], model_name: str = "gemini-2.5-flash_lite") -> None:
+
+        
         if not api_keys:
             raise ValueError("لیست کلیدهای API برای سرویس OCR خالی است!")
 
