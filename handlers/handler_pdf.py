@@ -8,7 +8,7 @@ from aiogram.exceptions import TelegramBadRequest
 
 from config import load_config
 from keyboards.inline import get_cancel_ocr_keyboard
-from services.ocr import OCRService
+from services.ocr import OCRService, OCRError
 from services.limiter import DailyLimiter
 from services.pdf_service import (
     PDFService,
@@ -21,11 +21,11 @@ logger = logging.getLogger(__name__)
 
 pdf_router = Router()
 
-# مقداردهی سرویس‌ها
+# مقداردهی سرویس‌ها (هماهنگ با سقف جدید ۳۰۰ صفحه)
 config = load_config()
 ocr_service = OCRService(api_keys=config.ai.api_keys)
 daily_limiter = DailyLimiter(max_requests=15, window_seconds=86400)
-pdf_service = PDFService(ocr_service=ocr_service, max_pages=70)
+pdf_service = PDFService(ocr_service=ocr_service, max_pages=300)
 
 
 # ==========================================
@@ -56,7 +56,7 @@ async def start_pdf_process(message: Message, state: FSMContext) -> None:
         f"📄 لطفاً فایل PDF مورد نظر خود را ارسال کنید.\n\n"
         f"📊 سهمیه باقی‌مانده شما: {html.bold(str(remaining))} درخواست\n\n"
         f"⚠️ قوانین پردازش:\n"
-        f"۱. حداکثر سقف مجاز: ۷۰ صفحه\n"
+        f"۱. حداکثر سقف مجاز: ۳۰۰ صفحه (حداکثر ۲۰ مگابایت)\n"
         f"۲. فایل‌های متنی دیجیتال: کاملاً رایگان (بدون کسر سهمیه)\n"
         f"۳. فایل‌های اسکن‌شده تصویری: کسر ۳ سهمیه",
         reply_markup=get_cancel_ocr_keyboard()
@@ -89,15 +89,7 @@ async def cancel_pdf_process(callback: CallbackQuery, state: FSMContext) -> None
 async def process_pdf_document(message: Message, state: FSMContext, bot: Bot) -> None:
     user_id = message.from_user.id
 
-    # خروج از استیت برای جلوگیری از ارسال فایل‌های مکرر در صف
-    await state.clear()
-
-    # بررسی مجدد سهمیه
-    if daily_limiter.get_remaining_quota(user_id=user_id) < 3:
-        await message.answer("⚠️ سهمیه روزانه شما برای پردازش این فایل کافی نیست.")
-        return
-
-    # بررسی پسوند فایل
+    # ۱. بررسی پسوند فایل (قبل از خارج کردن کاربر از استیت)
     file_name = message.document.file_name or "document.pdf"
     if not file_name.lower().endswith(".pdf"):
         await message.answer(
@@ -106,21 +98,45 @@ async def process_pdf_document(message: Message, state: FSMContext, bot: Bot) ->
         )
         return
 
+    # ۲. بررسی محدودیت حجم دانلود بات تلگرام (۲۰ مگابایت)
+    if message.document.file_size and message.document.file_size > 20 * 1024 * 1024:
+        await message.answer(
+            "❌ حجم فایل بیش از سقف مجاز تلگرام (۲۰ مگابایت) است.\n"
+            "لطفاً فایل کم‌حجم‌تری ارسال کنید یا دکمه انصراف را بزنید.",
+            reply_markup=get_cancel_ocr_keyboard()
+        )
+        return
+
+    # خروج از استیت برای جلوگیری از ارسال فایل‌های مکرر در صف پردازش
+    await state.clear()
+
+    # ۳. بررسی مجدد سهمیه
+    if daily_limiter.get_remaining_quota(user_id=user_id) < 3:
+        await message.answer("⚠️ سهمیه روزانه شما برای پردازش این فایل کافی نیست.")
+        return
+
     status_msg = await message.answer("⏳ در حال دانلود و ارزیابی لایه‌های فایل PDF...")
+    file_stream = io.BytesIO()
 
     try:
         # دانلود فایل به شکل جریانی در حافظه RAM
-        file_stream = io.BytesIO()
         await bot.download(file=message.document.file_id, destination=file_stream)
         file_bytes = file_stream.getvalue()
 
         try:
-            await status_msg.edit_text("⏳ در حال استخراج محتوا (لطفاً شکیبا باشید)...")
+            await status_msg.edit_text(
+                "⏳ در حال استخراج محتوا (در فایل‌های اسکن‌شده یا حجیم ممکن است کمی زمان‌بر باشد، لطفاً شکیبا باشید)..."
+            )
         except TelegramBadRequest:
             pass
 
-        # پردازش با متد کلاس سرویس
+        # پردازش هیبریدی و ناهمگام با متد کلاس سرویس
         full_text, is_scanned = await pdf_service.process_pdf(file_bytes=file_bytes)
+
+        # بررسی خالی نبودن خروجی قبل از کسر سهمیه
+        if not full_text.strip():
+            await status_msg.edit_text("⚠️ هیچ متن قابل تشخیصی در این سند یافت نشد.")
+            return
 
         # مدیریت کسر سهمیه
         if is_scanned:
@@ -129,10 +145,6 @@ async def process_pdf_document(message: Message, state: FSMContext, bot: Bot) ->
             usage_notice = "💡 این سند اسکن‌شده بود و ۳ سهمیه روزانه کسر گردید."
         else:
             usage_notice = "💡 این سند دارای لایه متنی بود و رایگان (بدون کسر سهمیه) پردازش شد."
-
-        if not full_text.strip():
-            await status_msg.edit_text("⚠️ هیچ متن قابل تشخیصی در این سند یافت نشد.")
-            return
 
         # ارسال بر اساس حجم متن (پیام چت یا فایل .txt)
         if len(full_text) < 4000:
@@ -147,9 +159,10 @@ async def process_pdf_document(message: Message, state: FSMContext, bot: Bot) ->
             except TelegramBadRequest:
                 pass
 
+            clean_name = file_name[:-4] if file_name.lower().endswith(".pdf") else file_name
             output_file = BufferedInputFile(
                 file=full_text.encode("utf-8"),
-                filename=f"Extracted_{file_name}.txt",
+                filename=f"Extracted_{clean_name}.txt",
             )
             await message.reply_document(
                 document=output_file,
@@ -172,12 +185,30 @@ async def process_pdf_document(message: Message, state: FSMContext, bot: Bot) ->
         except TelegramBadRequest:
             await message.reply(f"❌ {err}")
 
+    except OCRError as err:
+        logger.warning(f"خطای سرویس OCR در پردازش PDF کاربر {user_id}: {err}")
+        try:
+            await status_msg.edit_text(f"❌ خطا در ارتباط با هوش مصنوعی: {err}")
+        except TelegramBadRequest:
+            await message.reply(f"❌ خطا در ارتباط با هوش مصنوعی: {err}")
+
+    except (TimeoutError, ConnectionError) as err:
+        logger.error(f"خطای شبکه هنگام دانلود یا ارسال PDF: {err}")
+        try:
+            await status_msg.edit_text("❌ خطا در ارتباط شبکه هنگام دریافت فایل. لطفاً مجدداً تلاش کنید.")
+        except TelegramBadRequest:
+            await message.reply("❌ خطا در ارتباط شبکه هنگام دریافت فایل. لطفاً مجدداً تلاش کنید.")
+
     except Exception as err:
-        logger.exception(f"خطای پردازش فایل PDF: {err}")
+        logger.exception(f"خطای پیش‌بینی‌نشده در پردازش فایل PDF: {err}")
         try:
             await status_msg.edit_text("❌ متأسفانه در فرآیند استخراج متن PDF خطایی رخ داد.")
         except TelegramBadRequest:
             await message.reply("❌ متأسفانه در فرآیند استخراج متن PDF خطایی رخ داد.")
+
+    finally:
+        # آزادسازی بافر دانلود از حافظه رم سرور
+        file_stream.close()
 
 
 # ==========================================
