@@ -2,8 +2,6 @@ from aiogram.types import KeyboardButton, ReplyKeyboardMarkup
 
 
 def get_main_menu() -> ReplyKeyboardMarkup:
-
-    
     keyboard = [
         
         [
@@ -12,13 +10,13 @@ def get_main_menu() -> ReplyKeyboardMarkup:
         ],
         
         [
-            KeyboardButton(text="🎙 تبدیل ویس به متن"),
-            KeyboardButton(text="🔊 تبدیل متن به ویس"),
-        ],
-    
-        [
+            KeyboardButton(text="🔍 توصیف عکس"),
             KeyboardButton(text="🎵 تبدیل mp4 به mp3"),
-            KeyboardButton(text="🎬 کم کردن حجم ویدیو"),
+        ],
+        
+        [
+            KeyboardButton(text="📁 تبدیل متن به فایل"),
+            KeyboardButton(text="👤 پروفایل من"),
         ],
     ]
 
