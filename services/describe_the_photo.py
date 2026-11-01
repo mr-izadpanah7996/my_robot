@@ -32,7 +32,7 @@ class ImageDescriptionService:
         "با تکیه مستقیم بر خود تصویر و با در نظر گرفتن توصیف قبلی، پاسخی کامل، دقیق و متمرکز به زبان فارسی به پرسش کاربر بدهید."
     )
 
-    def __init__(self, api_keys: list[str], model_name: str = "gemini-2.5-flash-lite") -> None:
+    def __init__(self, api_keys: list[str], model_name: str = "gemini-3.5-flash-lite") -> None:
         if not api_keys:
             raise ValueError("لیست کلیدهای API برای سرویس توصیف تصویر خالی است!")
 
