@@ -86,7 +86,7 @@ async def _timeout_watcher(bot: Bot, chat_id: int, state: FSMContext, wait_secon
 
 
 # ۱. کلیک روی دکمه منوی اصلی
-@describe_router.message(F.text == "🖼 توصیف عکس")
+@describe_router.message(F.text == "🔍 توصیف عکس")
 async def start_describe_process(message: Message, state: FSMContext) -> None:
     user_id = message.from_user.id
     remaining = daily_limiter.get_remaining_quota(user_id=user_id)
