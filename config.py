@@ -8,6 +8,7 @@ class BotConfig:
     token: str
     admin_ids: list[int] = field(default_factory=list)
     channels: list[str] = field(default_factory=list)
+    api_server: str = "https://api.telegram.org"
 
 
 @dataclass(slots=True)
@@ -24,7 +25,6 @@ class Config:
 def load_config() -> Config:
 
     # پارامتر override=True تضمین می‌کند با تغییر فایل .env، مقادیر جدید حتما جایگزین شوند
-
     load_dotenv(override=True)
 
     bot_token = os.getenv("BOT_TOKEN", "").strip()
@@ -32,7 +32,6 @@ def load_config() -> Config:
         raise ValueError("خطای بحرانی: مقدار BOT_TOKEN در فایل .env تنظیم نشده است!")
 
     # پردازش آیدی ادمین‌ها: استخراج مقادیر معتبر عددی
-
     admin_ids_raw = os.getenv("ADMIN_IDS", "")
     admin_ids: list[int] = [
         int(item.strip())
@@ -41,7 +40,6 @@ def load_config() -> Config:
     ]
 
     # پردازش کلیدهای API: فیلتر کردن مقادیر خالی یا مقدار پیش‌فرض اولیه
-
     ai_keys_raw = os.getenv("AI_API_KEYS", "")
     api_keys: list[str] = [
         key.strip()
@@ -50,7 +48,6 @@ def load_config() -> Config:
     ]
 
     # پردازش یوزرنیم کانال‌ها: پاک‌سازی فاصله‌ها و اطمینان از وجود @ اول آیدی
-    
     channels_raw = os.getenv("CHANNELS", "")
     channels: list[str] = [
         f"@{ch.strip().lstrip('@')}"
@@ -58,11 +55,15 @@ def load_config() -> Config:
         if ch.strip()
     ]
 
+    # آدرس سرور تلگرام (پیش‌فرض رسمی، در صورت وجود لوکال از .env خوانده می‌شود)
+    api_server = os.getenv("TELEGRAM_API_SERVER", "https://api.telegram.org").strip()
+
     return Config(
         bot=BotConfig(
             token=bot_token,
             admin_ids=admin_ids,
             channels=channels,
+            api_server=api_server,
         ),
         ai=AIConfig(api_keys=api_keys),
     )
