@@ -30,7 +30,7 @@ class TextToFileService:
         self._temp_dir = Path(temp_dir)
         self._ensure_temp_dir()
 
-    def _ensure_temp_dir() -> None:
+    def _ensure_temp_dir(self) -> None:
         """اطمینان از وجود پوشه موقت با دسترسی مجاز"""
         try:
             self._temp_dir.mkdir(parents=True, exist_ok=True)
