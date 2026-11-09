@@ -214,21 +214,19 @@ class TextToFileService:
 
     def _build_pdf(self, text: str, base_name: str) -> Path:
         """
-        تولید فایل PDF استاندارد با پشتیبانی کامل از حروف چسبیده و راست‌چین فارسی
-        با استفاده از فونت Vazirmatn-Regular.ttf موجود در پروژه.
+        تولید قطعی فایل PDF با فونت استاندارد سیستمی DejaVuSans جهت رفع مربع‌های سیاه.
         """
         file_path = self._temp_dir / f"{base_name}.pdf"
 
-        # مسیر دقیق فایل فونت در ریشه پروژه (~/my_robot/Vazirmatn-Regular.ttf)
-        base_dir = Path(__file__).resolve().parent.parent
-        font_path = base_dir / "Vazirmatn-Regular.ttf"
-        font_name = "Vazirmatn"
+        # مسیر قطعی فونت سیستمی DejaVuSans
+        dejavu_font_path = Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
+        font_name = "DejaVuSans"
 
-        if font_path.exists():
+        if dejavu_font_path.exists():
             try:
-                pdfmetrics.registerFont(TTFont(font_name, str(font_path)))
-            except Exception:
-                pass
+                pdfmetrics.registerFont(TTFont(font_name, str(dejavu_font_path)))
+            except Exception as e:
+                logger.warning("ثبت فونت DejaVuSans ناموفق بود: %s", e)
         else:
             font_name = "Helvetica"
 
@@ -243,7 +241,7 @@ class TextToFileService:
 
         y = height - 50
         line_height = 20
-        margin_x = width - 50  # شروع از لبه راست برای راست‌چین بودن
+        margin_x = width - 50
 
         for raw_line in text.strip().splitlines():
             line = raw_line.strip()
@@ -251,11 +249,11 @@ class TextToFileService:
                 y -= line_height
                 continue
 
-            # ۱. اتصال حروف فارسی و اصلاح جهت متن (RTL)
+            # ۱. اتصال حروف فارسی و اعمال جهت RTL
             reshaped_text = arabic_reshaper.reshape(line)
             bidi_text = get_display(reshaped_text)
 
-            # ۲. مدیریت صفحات جدید در صورت پر شدن صفحه
+            # ۲. مدیریت صفحات جدید در صورت رسیدن به پایین برگه
             if y < 50:
                 pdf_canvas.showPage()
                 try:
@@ -264,7 +262,7 @@ class TextToFileService:
                     pdf_canvas.setFont("Helvetica", font_size)
                 y = height - 50
 
-            # ۳. درج متن با تراز از راست
+            # ۳. رسم خط با تراز از راست
             pdf_canvas.drawRightString(margin_x, y, bidi_text)
             y -= line_height
 
