@@ -9,6 +9,8 @@ from pathlib import Path
 import arabic_reshaper
 from bidi.algorithm import get_display
 from reportlab.lib.pagesizes import A4
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 logger = logging.getLogger(__name__)
@@ -213,17 +215,35 @@ class TextToFileService:
     def _build_pdf(self, text: str, base_name: str) -> Path:
         """
         تولید فایل PDF استاندارد با پشتیبانی کامل از حروف چسبیده و راست‌چین فارسی
-        همراه با مدیریت خودکار شکست صفحات (Multi-page).
+        با استفاده از فونت Vazirmatn-Regular.ttf موجود در پروژه.
         """
         file_path = self._temp_dir / f"{base_name}.pdf"
+
+        # مسیر دقیق فایل فونت در ریشه پروژه (~/my_robot/Vazirmatn-Regular.ttf)
+        base_dir = Path(__file__).resolve().parent.parent
+        font_path = base_dir / "Vazirmatn-Regular.ttf"
+        font_name = "Vazirmatn"
+
+        if font_path.exists():
+            try:
+                pdfmetrics.registerFont(TTFont(font_name, str(font_path)))
+            except Exception:
+                pass
+        else:
+            font_name = "Helvetica"
 
         pdf_canvas = canvas.Canvas(str(file_path), pagesize=A4)
         width, height = A4
 
-        # موقعیت شروع سطرها از بالای صفحه
+        font_size = 11
+        try:
+            pdf_canvas.setFont(font_name, font_size)
+        except Exception:
+            pdf_canvas.setFont("Helvetica", font_size)
+
         y = height - 50
         line_height = 20
-        margin_x = width - 50  # لبه سمت راست برای راست‌چین بودن متن فارسی
+        margin_x = width - 50  # شروع از لبه راست برای راست‌چین بودن
 
         for raw_line in text.strip().splitlines():
             line = raw_line.strip()
@@ -231,16 +251,20 @@ class TextToFileService:
                 y -= line_height
                 continue
 
-            # اتصال حروف فارسی و اعمال الگوریتم دوجهته (RTL)
+            # ۱. اتصال حروف فارسی و اصلاح جهت متن (RTL)
             reshaped_text = arabic_reshaper.reshape(line)
             bidi_text = get_display(reshaped_text)
 
-            # اگر متن به انتهای پایین صفحه رسید، صفحه جدید باز شود
+            # ۲. مدیریت صفحات جدید در صورت پر شدن صفحه
             if y < 50:
                 pdf_canvas.showPage()
+                try:
+                    pdf_canvas.setFont(font_name, font_size)
+                except Exception:
+                    pdf_canvas.setFont("Helvetica", font_size)
                 y = height - 50
 
-            # درج متن با تراز از راست
+            # ۳. درج متن با تراز از راست
             pdf_canvas.drawRightString(margin_x, y, bidi_text)
             y -= line_height
 
@@ -261,5 +285,4 @@ class TextToFileService:
                 logger.debug("فایل موقت پاک‌سازی شد: %s", target)
         except OSError as e:
             logger.warning("خطا در حذف فایل موقت %s: %s", file_path, e)
-
             
