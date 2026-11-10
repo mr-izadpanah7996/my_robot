@@ -16,7 +16,8 @@ def get_main_menu() -> ReplyKeyboardMarkup:
         
         [
             KeyboardButton(text="📁 تبدیل متن به فایل"),
-            KeyboardButton(text="👤 پروفایل من"),
+            
+            KeyboardButton(text="🎙 کم کردن حجم فایل صوتی"),
         ],
     ]
 
