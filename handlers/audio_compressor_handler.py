@@ -25,6 +25,13 @@ class AudioCompressorStates(StatesGroup):
     waiting_for_quality = State()
 
 
+def format_file_size(size_bytes: int) -> str:
+    """تبدیل بایت به فرمت خوانا (KB یا MB)"""
+    if size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f} KB"
+    return f"{size_bytes / (1024 * 1024):.2f} MB"
+
+
 async def safe_edit_text(message: Message, text: str, reply_markup=None) -> None:
     try:
         await message.edit_text(text, reply_markup=reply_markup)
@@ -123,10 +130,9 @@ async def handle_incoming_audio(message: Message, state: FSMContext) -> None:
 
 
 # رد پیام‌های غیرصوتی در استیت انتظار
-
 @router_audio_compressor.message(AudioCompressorStates.waiting_for_audio)
 async def handle_invalid_audio_input(message: Message) -> None:
-    await message.answer("⚠️ لطفاً فقط **فایل صوتی، ویس یا آهنگ** ارسال نمایید.")
+    await message.answer("⚠️ لطفاً فقط فایل صوتی، ویس یا آهنگ ارسال نمایید.")
 
 
 # ۳. مدیریت دکمه انصراف داخل کیبورد شیشه‌ای
@@ -192,11 +198,36 @@ async def process_audio_compression(
         except TelegramBadRequest:
             pass
 
+        # محاسبه حجم فایل اصلی قبل از تبدیل
+        original_size = Path(input_path).stat().st_size
+
         compressed_file_path = await compressor_service.compress_audio(
             input_path=input_path,
             bitrate=bitrate,
             bot_title="دلتا ربات",
         )
+
+        # محاسبه حجم فایل فشرده‌شده
+        compressed_size = Path(compressed_file_path).stat().st_size
+
+        # محاسبه درصد کاهش حجم
+        reduction_percent = 0
+        if original_size > compressed_size:
+            reduction_percent = round(((original_size - compressed_size) / original_size) * 100)
+
+        # ساخت گزارش مقایسه‌ای حجم
+        report_text = (
+            f"📊 گزارش بهینه‌سازی فایل صوتی:\n"
+            f"▫️ حجم اولیه: {format_file_size(original_size)}\n"
+            f"▫️ حجم فشرده‌شده: {format_file_size(compressed_size)}\n"
+            f"▫️ کاهش حجم: {reduction_percent}٪"
+        )
+
+        # ترکیب کپشن کاربر با گزارش فشرده‌سازی
+        if user_caption.strip():
+            final_caption = f"{user_caption}\n\n{report_text}"
+        else:
+            final_caption = report_text
 
         audio_to_send = FSInputFile(
             path=str(compressed_file_path),
@@ -207,7 +238,7 @@ async def process_audio_compression(
             audio=audio_to_send,
             title="دلتا ربات",
             performer="دلتا ربات",
-            caption=user_caption if user_caption else None,
+            caption=final_caption,
         )
 
         try:
