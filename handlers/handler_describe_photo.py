@@ -1,7 +1,8 @@
 import io
 import asyncio
 import logging
-from aiogram import Router, F, Bot, html
+from aiogram import Router, F, Bot
+from aiogram.filters import StateFilter
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
@@ -16,16 +17,18 @@ logger = logging.getLogger(__name__)
 describe_router = Router()
 
 # مقداردهی سرویس‌ها
-
 config = load_config()
 describe_service = ImageDescriptionService(api_keys=config.ai.api_keys)
 daily_limiter = DailyLimiter(max_requests=15, window_seconds=86400)
 
+# نگهداری امن تسک‌های تایمر کاربران در حافظه (جلوگیری از خطای سریال‌سازی FSM)
+_active_timers: dict[int, asyncio.Task] = {}
 
-# کلاس وضعیت‌های FSM برای توصیف تصویر
+FOLLOWUP_TIMEOUT_SECONDS = 180  # ۳ دقیقه
 
+
+# کلاس وضعیت‌های FSM برای توصیف تصویر (فقط مرحله سوال تکمیلی)
 class DescribePhotoState(StatesGroup):
-    waiting_for_photo = State()
     waiting_for_followup_question = State()
 
 
@@ -36,6 +39,13 @@ def get_cancel_describe_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="❌ انصراف", callback_data="cancel_describe")]
         ]
     )
+
+
+def _cancel_user_timer(user_id: int) -> None:
+    """لغو و حذف تسک تایمر فعال کاربر در صورت وجود"""
+    task = _active_timers.pop(user_id, None)
+    if task and not task.done():
+        task.cancel()
 
 
 def split_text_into_chunks(text: str, max_chars: int = 3800) -> list[str]:
@@ -69,8 +79,14 @@ def split_text_into_chunks(text: str, max_chars: int = 3800) -> list[str]:
     return chunks
 
 
-async def _timeout_watcher(bot: Bot, chat_id: int, state: FSMContext, wait_seconds: int = 120) -> None:
-    """تسک پس‌زمینه برای منقضی کردن حالت FSM پس از دو دقیقه"""
+async def _timeout_watcher(
+    bot: Bot,
+    chat_id: int,
+    user_id: int,
+    state: FSMContext,
+    wait_seconds: int = FOLLOWUP_TIMEOUT_SECONDS,
+) -> None:
+    """تسک پس‌زمینه برای منقضی کردن حالت FSM پس از ۳ دقیقه"""
     try:
         await asyncio.sleep(wait_seconds)
         current_state = await state.get_state()
@@ -78,70 +94,28 @@ async def _timeout_watcher(bot: Bot, chat_id: int, state: FSMContext, wait_secon
             await state.clear()
             await bot.send_message(
                 chat_id=chat_id,
-                text="⌛️ مهلت ۲ دقیقه‌ای شما برای پرسیدن سوال تکمیلی درباره این عکس به پایان رسید."
+                text="⌛️ مهلت ۳ دقیقه‌ای شما برای پرسیدن سوال تکمیلی درباره این عکس به پایان رسید."
             )
     except asyncio.CancelledError:
-        # وقتی کاربر سوال می‌پرسد یا انصراف می‌دهد، تسک لغو می‌شود
         pass
+    finally:
+        _active_timers.pop(user_id, None)
 
 
-# ۱. کلیک روی دکمه منوی اصلی
-@describe_router.message(F.text == "🔍 توصیف عکس")
-async def start_describe_process(message: Message, state: FSMContext) -> None:
-    user_id = message.from_user.id
-    remaining = daily_limiter.get_remaining_quota(user_id=user_id)
+# ۱. دریافت مستقیم یا فوروارد عکس زمانی که کاربر در هیچ وضعیت (State) فعالی نیست
 
-    if remaining <= 0:
-        await message.answer(
-            "⚠️ سهمیه روزانه شما (۱۵ درخواست در ۲۴ ساعت) به پایان رسیده است.\n"
-            "لطفاً در بازه ۲۴ ساعت آینده دوباره امتحان کنید."
-        )
-        return
-
-    await state.set_state(DescribePhotoState.waiting_for_photo)
-    await message.answer(
-        f"📸 لطفاً تصویر مورد نظر خود را برای توصیف با تمام جزئیات ارسال کنید.\n\n"
-        f"📊 سهمیه باقی‌مانده شما امروز: {html.bold(str(remaining))} عکس\n"
-        f"⚠️ لطفاً تصویر را به صورت فشرده (Photo) و تکی ارسال کنید.",
-        reply_markup=get_cancel_describe_keyboard()
-    )
-
-
-# ۲. دکمه شیشه‌ای انصراف
-@describe_router.callback_query(F.data == "cancel_describe")
-async def cancel_describe(callback: CallbackQuery, state: FSMContext) -> None:
-    # لغو تسک تایمر فعال (در صورت وجود)
-    data = await state.get_data()
-    timer_task: asyncio.Task | None = data.get("timer_task")
-    if timer_task and not timer_task.done():
-        timer_task.cancel()
-
-    current_state = await state.get_state()
-    if current_state is not None:
-        await state.clear()
-        try:
-            await callback.message.edit_text("❌ عملیات توصیف تصویر لغو شد.")
-        except TelegramBadRequest:
-            pass
-
-    try:
-        await callback.answer()
-    except TelegramBadRequest:
-        pass
-
-
-# ۳. دریافت عکس و توصیف اولیه آن با هوش مصنوعی
-@describe_router.message(DescribePhotoState.waiting_for_photo, F.photo)
+@describe_router.message(StateFilter(None), F.photo)
 async def process_photo_description(message: Message, state: FSMContext, bot: Bot) -> None:
     user_id = message.from_user.id
 
     if not daily_limiter.check_and_consume(user_id=user_id):
-        await state.clear()
         await message.answer(
-            "⚠️ سهمیه روزانه شما به اتمام رسیده است و این درخواست پردازش نشد."
+            "⚠️ سهمیه روزانه شما (۱۵ تصویر در ۲۴ ساعت) به پایان رسیده است.\n"
+            "لطفاً در بازه ۲۴ ساعت آینده دوباره امتحان کنید."
         )
         return
 
+    remaining = daily_limiter.get_remaining_quota(user_id=user_id)
     status_msg = await message.answer("⏳ در حال تحلیل و توصیف دقیق تصویر... لطفاً شکیبا باشید.")
 
     try:
@@ -151,7 +125,10 @@ async def process_photo_description(message: Message, state: FSMContext, bot: Bo
         image_bytes = image_stream.getvalue()
 
         # فراخوانی سرویس هوش مصنوعی جهت توصیف کامل عکس
-        description = await describe_service.describe_image(image_bytes=image_bytes, mime_type="image/jpeg")
+        description = await describe_service.describe_image(
+            image_bytes=image_bytes,
+            mime_type="image/jpeg",
+        )
 
         try:
             await status_msg.delete()
@@ -172,22 +149,29 @@ async def process_photo_description(message: Message, state: FSMContext, bot: Bo
         # تغییر وضعیت به انتظار برای سوال تکمیلی
         await state.set_state(DescribePhotoState.waiting_for_followup_question)
 
-        # شروع تایمر ۲ دقیقه‌ای در پس‌زمینه
-        timer_task = asyncio.create_task(
-            _timeout_watcher(bot=bot, chat_id=message.chat.id, state=state, wait_seconds=120)
+        # لغو تایمر احتمالی قبلی و شروع تایمر ۳ دقیقه‌ای جدید
+        _cancel_user_timer(user_id)
+        _active_timers[user_id] = asyncio.create_task(
+            _timeout_watcher(
+                bot=bot,
+                chat_id=message.chat.id,
+                user_id=user_id,
+                state=state,
+                wait_seconds=FOLLOWUP_TIMEOUT_SECONDS,
+            )
         )
 
-        # ذخیره تصویر، توصیف قبلی و تسک تایمر در استیت FSM
+        # ذخیره تصویر و توصیف قبلی در استیت FSM
         await state.update_data(
             image_bytes=image_bytes,
             initial_description=description,
-            timer_task=timer_task
         )
 
         await message.answer(
-            "💬 کاربر گرامی، شما به مدت ۲ دقیقه زمان دارید تا فقط یک سوال تکمیلی "
-            "جهت شرح جزئیات دقیق‌تر برای همین عکس بپرسید، یا در غیر این‌صورت دکمه انصراف را لمس کنید.",
-            reply_markup=get_cancel_describe_keyboard()
+            f"💬 شما به مدت ۳ دقیقه زمان دارید تا فقط یک سوال تکمیلی "
+            f"جهت شرح جزئیات دقیق‌تر برای همین عکس بپرسید، یا در غیر این‌صورت دکمه انصراف را لمس کنید.\n\n"
+            f"📊 سهمیه باقی‌مانده امروز: {remaining} تصویر",
+            reply_markup=get_cancel_describe_keyboard(),
         )
 
     except ImageDescriptionError as err:
@@ -206,16 +190,33 @@ async def process_photo_description(message: Message, state: FSMContext, bot: Bo
             await message.reply("❌ متأسفانه در حین تحلیل تصویر خطایی رخ داد.")
 
 
-# ۴. دریافت سوال تکمیلی کاربر درباره تصویر
+# ۲. دکمه شیشه‌ای انصراف از پرسش سوال تکمیلی
+@describe_router.callback_query(F.data == "cancel_describe")
+async def cancel_describe(callback: CallbackQuery, state: FSMContext) -> None:
+    user_id = callback.from_user.id
+    _cancel_user_timer(user_id)
+
+    current_state = await state.get_state()
+    if current_state is not None:
+        await state.clear()
+        try:
+            await callback.message.edit_text("❌ عملیات سوال تکمیلی لغو شد.")
+        except TelegramBadRequest:
+            pass
+
+    try:
+        await callback.answer()
+    except TelegramBadRequest:
+        pass
+
+
+# ۳. دریافت سوال تکمیلی کاربر درباره تصویر
 @describe_router.message(DescribePhotoState.waiting_for_followup_question, F.text)
 async def process_followup_question(message: Message, state: FSMContext) -> None:
+    user_id = message.from_user.id
+    _cancel_user_timer(user_id)
+
     data = await state.get_data()
-
-    # لغو فوری تایمر ۲ دقیقه‌ای
-    timer_task: asyncio.Task | None = data.get("timer_task")
-    if timer_task and not timer_task.done():
-        timer_task.cancel()
-
     image_bytes = data.get("image_bytes")
     initial_description = data.get("initial_description")
 
@@ -223,7 +224,7 @@ async def process_followup_question(message: Message, state: FSMContext) -> None
     await state.clear()
 
     if not image_bytes or not initial_description:
-        await message.reply("⚠️ اطلاعات تصویر منقضی شده است. لطفاً فرآیند را مجدداً شروع کنید.")
+        await message.reply("⚠️ اطلاعات تصویر منقضی شده است. لطفاً تصویر را مجدداً ارسال کنید.")
         return
 
     status_msg = await message.answer("🔍 در حال بررسی سوال و بررسی مجدد تصویر...")
@@ -234,7 +235,7 @@ async def process_followup_question(message: Message, state: FSMContext) -> None
             image_bytes=image_bytes,
             initial_description=initial_description,
             user_question=user_question,
-            mime_type="image/jpeg"
+            mime_type="image/jpeg",
         )
 
         try:
@@ -266,20 +267,12 @@ async def process_followup_question(message: Message, state: FSMContext) -> None
             await message.reply("❌ در پاسخ به سوال شما خطایی رخ داد.")
 
 
-# ۵. هندلر ورودی‌های اشتباه در فاز انتظار برای عکس
-@describe_router.message(DescribePhotoState.waiting_for_photo)
-async def invalid_photo_input_handler(message: Message) -> None:
-    await message.reply(
-        "⚠️ ورودی نامعتبر است! لطفاً فقط یک تصویر فشرده (Photo) ارسال کنید یا دکمه انصراف را لمس کنید.",
-        reply_markup=get_cancel_describe_keyboard()
-    )
-
-
-# ۶. هندلر ورودی‌های اشتباه در فاز سوال تکمیلی (ارسال فایل به جای متن سوال)
+# ۴. هندلر ورودی‌های اشتباه در فاز سوال تکمیلی (ارسال فایل یا عکس جدید به جای متن سوال)
 @describe_router.message(DescribePhotoState.waiting_for_followup_question)
 async def invalid_followup_input_handler(message: Message) -> None:
     await message.reply(
         "⚠️ لطفاً سوال تکمیلی خود را صرفاً به صورت متن تایپ و ارسال کنید، یا دکمه انصراف را لمس کنید.",
-        reply_markup=get_cancel_describe_keyboard()
+        reply_markup=get_cancel_describe_keyboard(),
     )
 
+    

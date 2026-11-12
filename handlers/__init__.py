@@ -18,12 +18,12 @@ router.include_routers(
 
     pdf_router,
 
-    describe_router,
-
     router_audio,
 
     router_text,
-    router_audio_compressor
+    router_audio_compressor,
+
+    describe_router
     
 
 )
