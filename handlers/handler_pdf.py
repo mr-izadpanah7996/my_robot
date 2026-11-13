@@ -6,9 +6,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.exceptions import TelegramBadRequest
 
-from config import load_config
 from keyboards.inline import get_cancel_ocr_keyboard
-from services.ocr import OCRService, OCRError
 from services.limiter import DailyLimiter
 from services.pdf_service import (
     PDFService,
@@ -21,11 +19,9 @@ logger = logging.getLogger(__name__)
 
 pdf_router = Router()
 
-# مقداردهی سرویس‌ها (سقف ۱۰۰۰ صفحه متنی / ۲۵ صفحه اسکن‌شده)
-config = load_config()
-ocr_service = OCRService(api_keys=config.ai.api_keys)
+# مقداردهی سرویس‌ها (سقف ۱۰۰۰ صفحه متنی / ۱۵۰ صفحه اسکن‌شده یا دارای فونت خراب)
 daily_limiter = DailyLimiter(max_requests=15, window_seconds=86400)
-pdf_service = PDFService(ocr_service=ocr_service, max_pages=1000, max_scanned_pages=25)
+pdf_service = PDFService(max_pages=1000, max_scanned_pages=150)
 
 
 # ==========================================
@@ -55,9 +51,8 @@ async def start_pdf_process(message: Message, state: FSMContext) -> None:
         f"📄 لطفاً فایل PDF مورد نظر خود را ارسال کنید.\n\n"
         f"📊 سهمیه باقی‌مانده شما: {html.bold(str(remaining))} درخواست\n\n"
         f"⚠️ قوانین پردازش:\n"
-        f"۱. فایل‌های متنی دیجیتال: تا ۱۰۰۰ صفحه کاملاً رایگان (بدون کسر سهمیه)\n"
-        f"۲. فایل‌های اسکن‌شده تصویری: تا ۲۵ صفحه با کسر ۳ سهمیه\n"
-        f"۳. حداکثر حجم مجاز فایل: ۲۰ مگابایت",
+        f"۱. فایل‌های متنی استاندارد: تا ۱۰۰۰ صفحه کاملاً رایگان (بدون کسر سهمیه)\n"
+        f"۲. فایل‌های اسکن‌شده یا دارای فونت غیراستاندارد (پردازش OCR): تا ۱۵۰ صفحه با کسر ۳ سهمیه",
         reply_markup=get_cancel_ocr_keyboard()
     )
 
@@ -98,7 +93,7 @@ async def process_pdf_document(message: Message, state: FSMContext, bot: Bot) ->
 
     if message.document.file_size and message.document.file_size > 20 * 1024 * 1024:
         await message.answer(
-            "❌ حجم فایل بیش از سقف مجاز تلگرام (۲۰ مگابایت) است.\n"
+            "❌ حجم فایل بیش از سقف مجاز تلگرام است.\n"
             "لطفاً فایل کم‌حجم‌تری ارسال کنید یا دکمه انصراف را بزنید.",
             reply_markup=get_cancel_ocr_keyboard()
         )
@@ -124,18 +119,18 @@ async def process_pdf_document(message: Message, state: FSMContext, bot: Bot) ->
         except TelegramBadRequest:
             pass
 
-        full_text, is_scanned = await pdf_service.process_pdf(file_bytes=file_bytes)
+        full_text, needs_ocr = await pdf_service.process_pdf(file_bytes=file_bytes)
 
         if not full_text.strip():
             await status_msg.edit_text("⚠️ هیچ متن قابل تشخیصی در این سند یافت نشد.")
             return
 
-        if is_scanned:
+        if needs_ocr:
             for _ in range(3):
                 daily_limiter.check_and_consume(user_id=user_id)
-            usage_notice = "💡 این سند اسکن‌شده بود و ۳ سهمیه روزانه کسر گردید."
+            usage_notice = "💡 این سند نیازمند پردازش تصویری (OCR) بود و ۳ سهمیه روزانه کسر گردید."
         else:
-            usage_notice = "💡 این سند دارای لایه متنی بود و رایگان (بدون کسر سهمیه) پردازش شد."
+            usage_notice = "💡 این سند دارای لایه متنی استاندارد بود و رایگان (بدون کسر سهمیه) پردازش شد."
 
         if len(full_text) < 4000:
             try:
@@ -174,13 +169,6 @@ async def process_pdf_document(message: Message, state: FSMContext, bot: Bot) ->
             await status_msg.edit_text(f"❌ {err}")
         except TelegramBadRequest:
             await message.reply(f"❌ {err}")
-
-    except OCRError as err:
-        logger.warning(f"خطای سرویس OCR در پردازش PDF کاربر {user_id}: {err}")
-        try:
-            await status_msg.edit_text(f"❌ خطا در ارتباط با هوش مصنوعی: {err}")
-        except TelegramBadRequest:
-            await message.reply(f"❌ خطا در ارتباط با هوش مصنوعی: {err}")
 
     except (TimeoutError, ConnectionError) as err:
         logger.error(f"خطای شبکه هنگام دانلود یا ارسال PDF: {err}")
