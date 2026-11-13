@@ -66,10 +66,6 @@ def load_config() -> Config:
     if not archive_channel_raw.lstrip("-").isdigit():
         raise ValueError("خطای بحرانی: مقدار VIDEO_ARCHIVE_CHANNEL_ID باید یک عدد معتبر باشد!")
 
-    # اطمینان از وجود پیشوند استاندارد -100 برای کانال‌های تلگرام
-    if not archive_channel_raw.startswith("-100"):
-        archive_channel_raw = f"-100{archive_channel_raw.lstrip('-')}"
-
     video_archive_channel_id = int(archive_channel_raw)
 
     return Config(
@@ -82,3 +78,4 @@ def load_config() -> Config:
         ),
         ai=AIConfig(api_keys=api_keys),
     )
+
