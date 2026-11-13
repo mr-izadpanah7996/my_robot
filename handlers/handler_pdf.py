@@ -21,11 +21,11 @@ logger = logging.getLogger(__name__)
 
 pdf_router = Router()
 
-# مقداردهی سرویس‌ها (هماهنگ با سقف جدید ۳۰۰ صفحه)
+# مقداردهی سرویس‌ها (سقف ۱۰۰۰ صفحه متنی / ۲۵ صفحه اسکن‌شده)
 config = load_config()
 ocr_service = OCRService(api_keys=config.ai.api_keys)
 daily_limiter = DailyLimiter(max_requests=15, window_seconds=86400)
-pdf_service = PDFService(ocr_service=ocr_service, max_pages=300)
+pdf_service = PDFService(ocr_service=ocr_service, max_pages=1000, max_scanned_pages=25)
 
 
 # ==========================================
@@ -43,7 +43,6 @@ async def start_pdf_process(message: Message, state: FSMContext) -> None:
     user_id = message.from_user.id
     remaining = daily_limiter.get_remaining_quota(user_id=user_id)
 
-    # بررسی حداقل سهمیه لازم برای شروع فرآیند پردازش
     if remaining < 3:
         await message.answer(
             f"⚠️ سهمیه روزانه شما برای این بخش کافی نیست.\n"
@@ -56,9 +55,9 @@ async def start_pdf_process(message: Message, state: FSMContext) -> None:
         f"📄 لطفاً فایل PDF مورد نظر خود را ارسال کنید.\n\n"
         f"📊 سهمیه باقی‌مانده شما: {html.bold(str(remaining))} درخواست\n\n"
         f"⚠️ قوانین پردازش:\n"
-        f"۱. حداکثر سقف مجاز: ۳۰۰ صفحه (حداکثر ۲۰ مگابایت)\n"
-        f"۲. فایل‌های متنی دیجیتال: کاملاً رایگان (بدون کسر سهمیه)\n"
-        f"۳. فایل‌های اسکن‌شده تصویری: کسر ۳ سهمیه",
+        f"۱. فایل‌های متنی دیجیتال: تا ۱۰۰۰ صفحه کاملاً رایگان (بدون کسر سهمیه)\n"
+        f"۲. فایل‌های اسکن‌شده تصویری: تا ۲۵ صفحه با کسر ۳ سهمیه\n"
+        f"۳. حداکثر حجم مجاز فایل: ۲۰ مگابایت",
         reply_markup=get_cancel_ocr_keyboard()
     )
 
@@ -75,7 +74,7 @@ async def cancel_pdf_process(callback: CallbackQuery, state: FSMContext) -> None
             await callback.message.edit_text("❌ عملیات اسکن فایل PDF لغو شد.")
         except TelegramBadRequest:
             pass
-            
+
     try:
         await callback.answer()
     except TelegramBadRequest:
@@ -89,7 +88,6 @@ async def cancel_pdf_process(callback: CallbackQuery, state: FSMContext) -> None
 async def process_pdf_document(message: Message, state: FSMContext, bot: Bot) -> None:
     user_id = message.from_user.id
 
-    # ۱. بررسی پسوند فایل (قبل از خارج کردن کاربر از استیت)
     file_name = message.document.file_name or "document.pdf"
     if not file_name.lower().endswith(".pdf"):
         await message.answer(
@@ -98,7 +96,6 @@ async def process_pdf_document(message: Message, state: FSMContext, bot: Bot) ->
         )
         return
 
-    # ۲. بررسی محدودیت حجم دانلود بات تلگرام (۲۰ مگابایت)
     if message.document.file_size and message.document.file_size > 20 * 1024 * 1024:
         await message.answer(
             "❌ حجم فایل بیش از سقف مجاز تلگرام (۲۰ مگابایت) است.\n"
@@ -107,10 +104,8 @@ async def process_pdf_document(message: Message, state: FSMContext, bot: Bot) ->
         )
         return
 
-    # خروج از استیت برای جلوگیری از ارسال فایل‌های مکرر در صف پردازش
     await state.clear()
 
-    # ۳. بررسی مجدد سهمیه
     if daily_limiter.get_remaining_quota(user_id=user_id) < 3:
         await message.answer("⚠️ سهمیه روزانه شما برای پردازش این فایل کافی نیست.")
         return
@@ -119,7 +114,6 @@ async def process_pdf_document(message: Message, state: FSMContext, bot: Bot) ->
     file_stream = io.BytesIO()
 
     try:
-        # دانلود فایل به شکل جریانی در حافظه RAM
         await bot.download(file=message.document.file_id, destination=file_stream)
         file_bytes = file_stream.getvalue()
 
@@ -130,15 +124,12 @@ async def process_pdf_document(message: Message, state: FSMContext, bot: Bot) ->
         except TelegramBadRequest:
             pass
 
-        # پردازش هیبریدی و ناهمگام با متد کلاس سرویس
         full_text, is_scanned = await pdf_service.process_pdf(file_bytes=file_bytes)
 
-        # بررسی خالی نبودن خروجی قبل از کسر سهمیه
         if not full_text.strip():
             await status_msg.edit_text("⚠️ هیچ متن قابل تشخیصی در این سند یافت نشد.")
             return
 
-        # مدیریت کسر سهمیه
         if is_scanned:
             for _ in range(3):
                 daily_limiter.check_and_consume(user_id=user_id)
@@ -146,7 +137,6 @@ async def process_pdf_document(message: Message, state: FSMContext, bot: Bot) ->
         else:
             usage_notice = "💡 این سند دارای لایه متنی بود و رایگان (بدون کسر سهمیه) پردازش شد."
 
-        # ارسال بر اساس حجم متن (پیام چت یا فایل .txt)
         if len(full_text) < 4000:
             try:
                 await status_msg.delete()
@@ -207,7 +197,6 @@ async def process_pdf_document(message: Message, state: FSMContext, bot: Bot) ->
             await message.reply("❌ متأسفانه در فرآیند استخراج متن PDF خطایی رخ داد.")
 
     finally:
-        # آزادسازی بافر دانلود از حافظه رم سرور
         file_stream.close()
 
 
