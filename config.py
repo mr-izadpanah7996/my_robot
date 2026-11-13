@@ -9,6 +9,7 @@ class BotConfig:
     admin_ids: list[int] = field(default_factory=list)
     channels: list[str] = field(default_factory=list)
     api_server: str = "https://api.telegram.org"
+    video_archive_channel_id: int = 0
 
 
 @dataclass(slots=True)
@@ -23,7 +24,6 @@ class Config:
 
 
 def load_config() -> Config:
-
     # پارامتر override=True تضمین می‌کند با تغییر فایل .env، مقادیر جدید حتما جایگزین شوند
     load_dotenv(override=True)
 
@@ -58,13 +58,27 @@ def load_config() -> Config:
     # آدرس سرور تلگرام (پیش‌فرض رسمی، در صورت وجود لوکال از .env خوانده می‌شود)
     api_server = os.getenv("TELEGRAM_API_SERVER", "https://api.telegram.org").strip()
 
+    # پردازش آیدی عددی کانال خصوصی آرشیو موقت ویدیو
+    archive_channel_raw = os.getenv("VIDEO_ARCHIVE_CHANNEL_ID", "").strip()
+    if not archive_channel_raw:
+        raise ValueError("خطای بحرانی: مقدار VIDEO_ARCHIVE_CHANNEL_ID در فایل .env تنظیم نشده است!")
+
+    if not archive_channel_raw.lstrip("-").isdigit():
+        raise ValueError("خطای بحرانی: مقدار VIDEO_ARCHIVE_CHANNEL_ID باید یک عدد معتبر باشد!")
+
+    # اطمینان از وجود پیشوند استاندارد -100 برای کانال‌های تلگرام
+    if not archive_channel_raw.startswith("-100"):
+        archive_channel_raw = f"-100{archive_channel_raw.lstrip('-')}"
+
+    video_archive_channel_id = int(archive_channel_raw)
+
     return Config(
         bot=BotConfig(
             token=bot_token,
             admin_ids=admin_ids,
             channels=channels,
             api_server=api_server,
+            video_archive_channel_id=video_archive_channel_id,
         ),
         ai=AIConfig(api_keys=api_keys),
     )
-

@@ -9,13 +9,11 @@ logger = logging.getLogger(__name__)
 
 
 class VideoCompressionError(Exception):
-    """استثنای اختصاصی برای خطاهای حین فشرده‌سازی فایل ویدیویی"""
     pass
 
 
 @dataclass(slots=True)
 class CompressedVideoResult:
-    """مدل خروجی شامل مسیر فایل فشرده‌شده و مشخصات فنی برای نمایش استاندارد در تلگرام"""
     output_path: Path
     width: int
     height: int
@@ -23,24 +21,19 @@ class CompressedVideoResult:
 
 
 class VideoCompressorService:
-    """
-    سرویس فشرده‌سازی ویدیو با استفاده از ابزارهای سیستمی ffmpeg و ffprobe.
-    مجهز به سمافور تک‌ظرفیتی (Semaphore=1)، کنترل تردهای CPU و مدیریت جامع خطاها.
-    """
-
-    # تنظیمات سطوح کیفیت: (مقدار CRF، حداکثر ضلع کوچک/ارتفاع مجاز)
+    # تنظیمات هر سطح کیفیت: مقدار CRF، سقف رزولوشن ضلع کوچک و بیت‌ریت صدا
     QUALITY_PRESETS = {
-        "low": {"crf": "24", "max_short_side": 1080},     # فشرده‌سازی کم (حفظ حداکثری کیفیت)
-        "medium": {"crf": "28", "max_short_side": 720},   # فشرده‌سازی متعادل (پیشنهادی)
-        "high": {"crf": "32", "max_short_side": 480},     # فشرده‌سازی بالا (حداکثر کاهش حجم)
+        "low": {"crf": "25", "max_short_side": 720, "audio_bitrate": "96k"},
+        "medium": {"crf": "28", "max_short_side": 480, "audio_bitrate": "96k"},
+        "high": {"crf": "32", "max_short_side": 240, "audio_bitrate": "64k"},
     }
 
     def __init__(
         self,
         max_concurrent_tasks: int = 1,
         temp_dir: Path | str = "/tmp/delta_video_conversions",
-        process_timeout: int = 900,  # ۱۵ دقیقه مهلت برای فایل‌های سنگین تا ۶۰۰ مگابایت
-        ffmpeg_threads: int = 2,     # جلوگیری از قفل شدن کل هسته‌های CPU سرور حین رندر
+        process_timeout: int = 900,
+        ffmpeg_threads: int = 2,
     ) -> None:
         self._semaphore = asyncio.Semaphore(max_concurrent_tasks)
         self._temp_dir = Path(temp_dir)
@@ -49,7 +42,6 @@ class VideoCompressorService:
         self._ensure_temp_dir()
 
     def _ensure_temp_dir(self) -> None:
-        """اطمینان از وجود پوشه موقت و دسترسی مجاز روی سرور"""
         try:
             self._temp_dir.mkdir(parents=True, exist_ok=True)
         except OSError as e:
@@ -57,14 +49,12 @@ class VideoCompressorService:
             raise VideoCompressionError(f"دسترسی به پوشه موقت ویدیو مقدور نیست: {e}") from e
 
     def get_temp_dir(self) -> Path:
-        """برگرداندن مسیر دایرکتوری موقت برای ذخیره دانلودها"""
         self._ensure_temp_dir()
         return self._temp_dir
 
     @staticmethod
     def _extract_rotation(video_stream: dict) -> int:
-        """استخراج زاویه چرخش تصویر از تگ‌های قدیمی و Display Matrix مدرن"""
-        # ۱. بررسی تگ قدیمی rotate
+        # چک کردن تگ rotate قدیمی
         tags = video_stream.get("tags", {})
         rotate_tag = str(tags.get("rotate", "0")).strip()
         if rotate_tag.lstrip("-").isdigit():
@@ -72,7 +62,7 @@ class VideoCompressorService:
             if val != 0:
                 return val
 
-        # ۲. بررسی side_data_list در نسخه‌های جدید ffprobe و گوشی‌های مدرن
+        # چک کردن Display Matrix در ویدیوهای موبایل جدید
         for side_data in video_stream.get("side_data_list", []):
             if "rotation" in side_data:
                 rot_val = str(side_data["rotation"]).strip()
@@ -82,9 +72,6 @@ class VideoCompressorService:
         return 0
 
     async def _probe_video_metadata(self, video_path: Path) -> tuple[int, int, int]:
-        """
-        استخراج عرض، ارتفاع و مدت زمان ویدیو با ffprobe (با پشتیبانی کامل از ویدیوهای عمودی موبایل)
-        """
         cmd = [
             "ffprobe",
             "-v", "quiet",
@@ -116,7 +103,6 @@ class VideoCompressorService:
             width = int(video_stream.get("width", 0))
             height = int(video_stream.get("height", 0))
 
-            # اصلاح جابه‌جایی عرض و ارتفاع در صورت وجود متادیتای چرخش
             rotation = self._extract_rotation(video_stream)
             if abs(rotation) in (90, 270):
                 width, height = height, width
@@ -129,16 +115,18 @@ class VideoCompressorService:
 
             return max(0, width), max(0, height), max(0, duration)
 
-        except asyncio.TimeoutError:
+        except (asyncio.TimeoutError, asyncio.CancelledError):
             if process:
                 try:
                     process.kill()
                 except ProcessLookupError:
                     pass
-            logger.warning("تایم‌اوت در استخراج متادیتای ویدیو %s", video_path.name)
+            if isinstance(process, asyncio.CancelledError):
+                raise
+            logger.warning("تایم‌اوت در خواندن متادیتای ویدیو %s", video_path.name)
             return 0, 0, 0
         except FileNotFoundError:
-            logger.warning("ابزار ffprobe روی سرور یافت نشد؛ ارسال بدون ابعاد دقیق انجام می‌شود.")
+            logger.warning("ابزار ffprobe روی سرور پیدا نشد.")
             return 0, 0, 0
         except Exception as e:
             logger.warning("خطا در خواندن متادیتای ویدیو %s: %s", video_path.name, e)
@@ -150,35 +138,23 @@ class VideoCompressorService:
         quality_level: str,
         bot_title: str = "دلتا ربات",
     ) -> CompressedVideoResult:
-        """
-        فشرده‌سازی فایل ویدیویی به فرمت استاندارد MP4 همراه با متادیتای عنوان اختصاصی.
-
-        :param input_path: مسیر فایل ویدیویی دانلودشده روی سرور
-        :param quality_level: سطح فشرده‌سازی ('low', 'medium', 'high')
-        :param bot_title: عنوان ثبت‌شده در متادیتای ویدیو
-        :return: شیء CompressedVideoResult شامل مسیر خروجی و ابعاد تصویر
-        :raises VideoCompressionError: در صورت خرابی فایل، اتمام زمان یا خطای انکودینگ
-        """
         in_file = Path(input_path)
         if not in_file.exists() or in_file.stat().st_size == 0:
             raise VideoCompressionError("فایل ویدیویی ورودی یافت نشد یا حجم آن صفر است.")
 
         preset_config = self.QUALITY_PRESETS.get(quality_level.lower().strip())
         if not preset_config:
-            raise VideoCompressionError(
-                f"سطح فشرده‌سازی نامعتبر است: {quality_level}. مقادیر مجاز: {list(self.QUALITY_PRESETS.keys())}"
-            )
+            raise VideoCompressionError(f"سطح فشرده‌سازی نامعتبر است: {quality_level}")
 
         crf_value = preset_config["crf"]
         max_side = preset_config["max_short_side"]
+        audio_bitrate = preset_config["audio_bitrate"]
 
         self._ensure_temp_dir()
         unique_id = uuid.uuid4().hex[:8]
         output_path = self._temp_dir / f"compressed_{unique_id}.mp4"
 
-        # فرمول هوشمند مقیاس‌دهی برای ویدیوهای افقی و عمودی:
-        # ضلع کوچک‌تر تصویر را حداکثر تا max_side پایین می‌آورد، نسبت تصویر را حفظ می‌کند،
-        # هرگز ویدیوی کوچک را بزرگ‌تر (Upscale) نمی‌کند و ابعاد را زوج (-2) نگه می‌دارد.
+        # تغییر ابعاد متناسب با ضلع کوچک تصویر و زوج‌سازی (-2) برای سازگاری با H.264
         scale_filter = (
             f"scale='if(gt(min(iw,ih),{max_side}),if(gt(iw,ih),-2,{max_side}),trunc(iw/2)*2)':"
             f"'if(gt(min(iw,ih),{max_side}),if(gt(iw,ih),{max_side},-2),trunc(ih/2)*2)'"
@@ -187,27 +163,28 @@ class VideoCompressorService:
         cmd = [
             "ffmpeg",
             "-hide_banner",
-            "-loglevel", "error",             # ثبت دقیق خطاها بدون اشغال بی‌مورد بافر حافظه
-            "-y",                             # رونویسی خودکار فایل هم‌نام
-            "-i", str(in_file),               # فایل ورودی
-            "-map", "0:v:0",                  # انتخاب اولین ترک ویدیو
-            "-map", "0:a?",                   # انتخاب ترک صدا در صورت وجود (عدم خطا روی ویدیوی بی‌صدا)
-            "-vf", scale_filter,              # اعمال فیلتر هوشمند رزولوشن و زوج‌سازی ابعاد
-            "-c:v", "libx264",                # انکودر استاندارد H.264 سازگار با تمام گوشی‌ها و تلگرام
-            "-preset", "veryfast",            # تعادل عالی بین سرعت پردازش و فشرده‌سازی
-            "-crf", crf_value,                # میزان فشرده‌سازی هدف
-            "-threads", self._ffmpeg_threads, # کنترل مصرف هسته‌های CPU برای پاسخ‌گویی روان ربات
-            "-pix_fmt", "yuv420p",            # فرمت رنگی استاندارد برای پخش صحیح در آیفون و اندروید
-            "-c:a", "aac",                    # انکودر استاندارد صدا
-            "-b:a", "96k",                    # بیت‌ریت صوتی سبک و شفاف
-            "-ar", "44100",                   # استانداردسازی نرخ نمونه‌برداری صدا
-            "-movflags", "+faststart",        # بهینه‌سازی هدر MP4 برای استریم و پخش فوری در تلگرام
+            "-loglevel", "error",
+            "-y",
+            "-i", str(in_file),
+            "-map", "0:v:0",
+            "-map", "0:a?",
+            "-vf", scale_filter,
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", crf_value,
+            "-threads", self._ffmpeg_threads,
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-b:a", audio_bitrate,
+            "-ar", "44100",
+            "-max_muxing_queue_size", "1024",
+            "-movflags", "+faststart",
             "-metadata", f"title={bot_title}",
             str(output_path),
         ]
 
         logger.info(
-            "درخواست فشرده‌سازی ویدیو %s با سطح '%s' (CRF=%s) وارد صف سمافور شد.",
+            "ویدیو %s با کیفیت %s (CRF=%s) وارد صف پردازش شد.",
             in_file.name,
             quality_level,
             crf_value,
@@ -216,7 +193,7 @@ class VideoCompressorService:
         process = None
         try:
             async with self._semaphore:
-                logger.info("پردازش رندر ویدیو %s با ffmpeg آغاز شد.", in_file.name)
+                logger.info("شروع رندر ویدیو %s", in_file.name)
                 process = await asyncio.create_subprocess_exec(
                     *cmd,
                     stdout=asyncio.subprocess.PIPE,
@@ -231,7 +208,7 @@ class VideoCompressorService:
                 if process.returncode != 0:
                     err_msg = stderr.decode(errors="ignore").strip()
                     short_err = err_msg[-500:] if len(err_msg) > 500 else err_msg
-                    logger.error("خطای اجرای ffmpeg در ویدیو (کد %s): %s", process.returncode, short_err)
+                    logger.error("خطای ffmpeg (کد %s): %s", process.returncode, short_err)
                     raise VideoCompressionError(
                         "فایل ویدیویی آسیب دیده است، فاقد تصویر معتبر است یا فرمت آن پشتیبانی نمی‌شود."
                     )
@@ -243,11 +220,7 @@ class VideoCompressorService:
                 except ProcessLookupError:
                     pass
             self.safe_remove(output_path)
-            logger.error(
-                "پردازش ویدیو %s به دلیل اتمام زمان مجاز (%s ثانیه) متوقف شد.",
-                in_file.name,
-                self._process_timeout,
-            )
+            logger.error("تایم‌اوت در پردازش ویدیو %s", in_file.name)
             raise VideoCompressionError("زمان پردازش این ویدیو بیش از حد مجاز طول کشید و متوقف شد.")
 
         except asyncio.CancelledError:
@@ -257,12 +230,12 @@ class VideoCompressorService:
                 except ProcessLookupError:
                     pass
             self.safe_remove(output_path)
-            logger.warning("تسک فشرده‌سازی ویدیو %s لغو شد.", in_file.name)
+            logger.warning("پردازش ویدیو %s لغو شد.", in_file.name)
             raise
 
         except FileNotFoundError:
             self.safe_remove(output_path)
-            logger.critical("ابزار ffmpeg روی سرور شناسایی نشد.")
+            logger.critical("ابزار ffmpeg روی سرور نصب نیست.")
             raise VideoCompressionError("سرویس پردازش ویدیو در سرور در دسترس نیست.")
 
         except VideoCompressionError:
@@ -271,7 +244,7 @@ class VideoCompressorService:
 
         except Exception as e:
             self.safe_remove(output_path)
-            logger.exception("خطای غیرمنتظره حین فشرده‌سازی ویدیو: %s", e)
+            logger.exception("خطای پیش‌بینی‌نشده در پردازش ویدیو: %s", e)
             raise VideoCompressionError("خطای ناشناخته در پردازش ویدیو رخ داد.") from e
 
         if not output_path.exists() or output_path.stat().st_size == 0:
@@ -281,7 +254,7 @@ class VideoCompressorService:
         width, height, duration = await self._probe_video_metadata(output_path)
 
         logger.info(
-            "ویدیو با موفقیت فشرده شد: %s (حجم: %s بایت | ابعاد: %sx%s | مدت: %s ثانیه)",
+            "ویدیو آماده شد: %s (%s بایت | %sx%s | %s ثانیه)",
             output_path.name,
             output_path.stat().st_size,
             width,
@@ -298,15 +271,13 @@ class VideoCompressorService:
 
     @staticmethod
     def safe_remove(file_path: Path | str | None) -> None:
-        """حذف ایمن فایل‌های موقت از روی دیسک بدون پرتاب استثنا"""
         if file_path is None:
             return
         try:
             target = Path(file_path)
             if target.exists():
                 target.unlink()
-                logger.debug("فایل موقت ویدیو پاک‌سازی شد: %s", target)
         except OSError as e:
-            logger.warning("خطا در حذف فایل موقت ویدیو %s: %s", file_path, e)
+            logger.warning("خطا در حذف فایل موقت %s: %s", file_path, e)
 
             

@@ -5,13 +5,15 @@ from pathlib import Path
 
 from aiogram import Bot, F, Router
 from aiogram.enums import ChatAction
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, FSInputFile, Message
 
+from config import load_config
 from keyboards.vid_compress_inline import (
     VideoCompressCallback,
+    get_video_download_keyboard,
     get_video_quality_guide_text,
     get_video_quality_keyboard,
 )
@@ -19,45 +21,48 @@ from services.video_compressor_service import VideoCompressionError, VideoCompre
 
 logger = logging.getLogger(__name__)
 
-# نام مستقل روتر برای جلوگیری از هرگونه تداخل با روتر مادر
-router_video_compressor = Router()
+_config = load_config()
+ARCHIVE_CHANNEL_ID = _config.bot.video_archive_channel_id
 
+router_video_compressor = Router()
 video_compressor_service = VideoCompressorService()
 
-# محدودیت حداکثر حجم ورودی (۶۰۰ مگابایت)
 MAX_VIDEO_SIZE_MB = 600
 MAX_VIDEO_SIZE_BYTES = MAX_VIDEO_SIZE_MB * 1024 * 1024
-
-# پسوندهای معتبر فایل‌های اسنادی ویدیویی
 ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".wmv", ".3gp", ".m4v"}
 
 
 # ==========================================
-# وضعیت‌های FSM (State Machine)
+# وضعیت‌های FSM
 # ==========================================
 class VideoCompressorStates(StatesGroup):
     waiting_for_video = State()
     waiting_for_quality = State()
+    waiting_for_download = State()
 
 
 # ==========================================
 # توابع کمکی
 # ==========================================
 def format_file_size(size_bytes: int) -> str:
-    """تبدیل بایت به فرمت خوانا (KB یا MB)"""
     if size_bytes < 1024 * 1024:
         return f"{size_bytes / 1024:.1f} KB"
     return f"{size_bytes / (1024 * 1024):.2f} MB"
 
 
 async def safe_edit_text(message: Message, text: str, reply_markup=None, parse_mode: str | None = "Markdown") -> None:
-    """ویرایش ایمن پیام با مدیریت کامل خطای TelegramBadRequest"""
     try:
         await message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
     except TelegramBadRequest as e:
         err_str = str(e).lower()
         if "message is not modified" in err_str:
             pass
+        elif "can't parse entities" in err_str and parse_mode is not None:
+            # تلاش مجدد بدون فرمت‌دهی در صورت وجود کاراکتر ناسازگار
+            try:
+                await message.edit_text(text, reply_markup=reply_markup, parse_mode=None)
+            except TelegramBadRequest:
+                pass
         elif "message to edit not found" in err_str:
             await message.answer(text, reply_markup=reply_markup, parse_mode=parse_mode)
         else:
@@ -66,22 +71,41 @@ async def safe_edit_text(message: Message, text: str, reply_markup=None, parse_m
         logger.error("خطای غیرمنتظره در ویرایش پیام ویدیو: %s", e)
 
 
-async def _auto_delete_video_messages(bot: Bot, chat_id: int, message_ids: list[int], delay_seconds: int = 25) -> None:
-    """
-    تسک پس‌زمینه برای حذف خودکار ویدیوی ارسال‌شده و پیام هشدار پس از ۲۵ ثانیه
-    جهت حفظ امنیت ربات و جلوگیری از باقی ماندن محتوای حساس در تاریخچه چت.
-    """
+async def _delete_single_message_later(bot: Bot, chat_id: int, message_id: int, delay_seconds: int) -> None:
     try:
         await asyncio.sleep(delay_seconds)
-        for msg_id in message_ids:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except (TelegramBadRequest, TelegramForbiddenError, asyncio.CancelledError):
+        pass
+    except Exception as e:
+        logger.warning("خطا در پاک‌سازی زمان‌بندی‌شده پیام آرشیو: %s", e)
+
+
+async def _auto_cleanup_delivered_video(
+    bot: Bot,
+    user_chat_id: int,
+    user_message_ids: list[int],
+    archive_chat_id: int | None,
+    archive_message_id: int | None,
+    delay_seconds: int = 25,
+) -> None:
+    try:
+        await asyncio.sleep(delay_seconds)
+        for msg_id in user_message_ids:
             try:
-                await bot.delete_message(chat_id=chat_id, message_id=msg_id)
-            except TelegramBadRequest:
+                await bot.delete_message(chat_id=user_chat_id, message_id=msg_id)
+            except (TelegramBadRequest, TelegramForbiddenError):
+                pass
+
+        if archive_chat_id and archive_message_id:
+            try:
+                await bot.delete_message(chat_id=archive_chat_id, message_id=archive_message_id)
+            except (TelegramBadRequest, TelegramForbiddenError):
                 pass
     except asyncio.CancelledError:
         pass
     except Exception as e:
-        logger.warning("خطا در حذف خودکار پیام‌های ویدیو: %s", e)
+        logger.warning("خطا در پاک‌سازی خودکار پیام‌های ویدیو: %s", e)
 
 
 # ==========================================
@@ -89,11 +113,20 @@ async def _auto_delete_video_messages(bot: Bot, chat_id: int, message_ids: list[
 # ==========================================
 @router_video_compressor.message(F.text == "🎬 کم کردن حجم ویدیو")
 async def start_video_compressor(message: Message, state: FSMContext) -> None:
-    """ورود کاربر به بخش کاهش حجم ویدیو و پاک‌سازی وضعیت‌های ناتمام قبلی"""
     old_data = await state.get_data()
+
+    # پاک‌سازی فایل ناتمام روی دیسک در صورت وجود
     old_file = old_data.get("input_file_path")
     if old_file:
         video_compressor_service.safe_remove(old_file)
+
+    # پاک‌سازی پیام قبلی در کانال آرشیو اگر کاربر بدون دریافت ویدیوی قبلی مجدد شروع کرد
+    old_archive_msg_id = old_data.get("archive_message_id")
+    if old_archive_msg_id and ARCHIVE_CHANNEL_ID:
+        try:
+            await message.bot.delete_message(chat_id=ARCHIVE_CHANNEL_ID, message_id=old_archive_msg_id)
+        except (TelegramBadRequest, TelegramForbiddenError):
+            pass
 
     await state.clear()
     await state.set_state(VideoCompressorStates.waiting_for_video)
@@ -116,7 +149,6 @@ async def start_video_compressor(message: Message, state: FSMContext) -> None:
     F.video | F.document,
 )
 async def handle_incoming_video(message: Message, state: FSMContext) -> None:
-    """بررسی حجم و فرمت ویدیو، دانلود روی سرور و نمایش کیبورد انتخاب کیفیت"""
     file_id = None
     file_size = 0
     original_file_name = "video.mp4"
@@ -144,7 +176,6 @@ async def handle_incoming_video(message: Message, state: FSMContext) -> None:
         file_size = doc.file_size or 0
         original_file_name = doc.file_name or "document_video.mp4"
 
-    # بررسی سقف حجم مجاز ۶۰۰ مگابایت پیش از دانلود
     if file_size > MAX_VIDEO_SIZE_BYTES:
         await message.answer(
             f"❌ حجم فایل ارسالی شما ({format_file_size(file_size)}) بیشتر از سقف مجاز "
@@ -166,10 +197,8 @@ async def handle_incoming_video(message: Message, state: FSMContext) -> None:
         unique_name = f"vid_in_{uuid.uuid4().hex[:8]}{file_extension}"
         input_file_path = temp_dir / unique_name
 
-        # دانلود محلی فایل (سازگار با لوکال بات سرور)
         await bot.download_file(file_info.file_path, destination=input_file_path)
 
-        # بررسی مجدد حجم واقعی پس از دانلود روی دیسک
         actual_disk_size = input_file_path.stat().st_size
         if actual_disk_size > MAX_VIDEO_SIZE_BYTES:
             video_compressor_service.safe_remove(input_file_path)
@@ -222,7 +251,6 @@ async def handle_incoming_video(message: Message, state: FSMContext) -> None:
 # ==========================================
 @router_video_compressor.message(VideoCompressorStates.waiting_for_video)
 async def handle_invalid_video_input(message: Message) -> None:
-    """راهنمایی کاربر در صورت ارسال متن، عکس یا صدا به جای ویدیو"""
     await message.answer("⚠️ لطفاً فقط یک **فایل ویدیویی** ارسال نمایید.", parse_mode="Markdown")
 
 
@@ -234,7 +262,6 @@ async def handle_invalid_video_input(message: Message) -> None:
     VideoCompressCallback.filter(F.action == "cancel"),
 )
 async def process_video_cancel_callback(callback: CallbackQuery, state: FSMContext) -> None:
-    """لغو عملیات فشرده‌سازی ویدیو و پاک‌سازی فایل موقت از دیسک"""
     data = await state.get_data()
     input_path = data.get("input_file_path")
 
@@ -256,7 +283,7 @@ async def process_video_cancel_callback(callback: CallbackQuery, state: FSMConte
 
 
 # ==========================================
-# ۴. پردازش و فشرده‌سازی ویدیو با کیفیت انتخابی
+# ۴. پردازش ویدیو و انتقال موقت به کانال آرشیو
 # ==========================================
 @router_video_compressor.callback_query(
     VideoCompressorStates.waiting_for_quality,
@@ -267,7 +294,6 @@ async def process_video_compression(
     callback_data: VideoCompressCallback,
     state: FSMContext,
 ) -> None:
-    """اجرای فشرده‌سازی ویدیو در صف سمافور و ارسال خروجی با تایمر حذف ۲۵ ثانیه‌ای"""
     try:
         await callback.answer()
     except TelegramBadRequest:
@@ -287,7 +313,6 @@ async def process_video_compression(
         )
         return
 
-    # بستن دکمه‌های شیشه‌ای بلافاصله پس از انتخاب جهت جلوگیری از کلیک تکراری
     await safe_edit_text(
         callback.message,
         "⚙️ ویدیوی شما در صف پردازش قرار گرفت...\n"
@@ -297,9 +322,9 @@ async def process_video_compression(
     )
 
     compressed_result = None
+    compression_succeeded = False
 
     try:
-        # نمایش وضعیت در حال آپلود ویدیو در تلگرام
         try:
             await callback.message.bot.send_chat_action(
                 chat_id=callback.message.chat.id,
@@ -310,7 +335,6 @@ async def process_video_compression(
 
         original_size = data.get("original_size") or Path(input_path).stat().st_size
 
-        # پردازش ویدیو از طریق سرویس (با سمافور ۱، ترد کنترل‌شده و متادیتای 'دلتا ربات')
         compressed_result = await video_compressor_service.compress_video(
             input_path=input_path,
             quality_level=quality_level,
@@ -319,12 +343,10 @@ async def process_video_compression(
 
         compressed_size = compressed_result.output_path.stat().st_size
 
-        # محاسبه درصد کاهش حجم
         reduction_percent = 0
         if original_size > compressed_size:
             reduction_percent = round(((original_size - compressed_size) / original_size) * 100)
 
-        # ساخت گزارش بهینه‌سازی برای بخش توضیحات ویدیو
         report_text = (
             f"🎬 عنوان: دلتا ربات\n"
             f"📊 گزارش کاهش حجم ویدیو:\n"
@@ -333,7 +355,6 @@ async def process_video_compression(
             f"▫️ میزان کاهش: {reduction_percent}٪"
         )
 
-        # جلوگیری از عبور کپشن ترکیبی از سقف ۱۰۲۴ کاراکتر تلگرام
         clean_user_caption = user_caption.strip()
         if clean_user_caption:
             max_allowed_user_len = 1024 - len(report_text) - 5
@@ -343,23 +364,124 @@ async def process_video_compression(
         else:
             final_caption = report_text
 
-        video_to_send = FSInputFile(
+        video_to_upload = FSInputFile(
             path=str(compressed_result.output_path),
             filename="Delta_Video.mp4",
         )
 
-        # ارسال ویدیوی فشرده‌شده با مشخصات فنی دقیق و parse_mode=None برای امنیت کپشن کاربر
-        sent_video_msg = await callback.message.answer_video(
-            video=video_to_send,
+        # آپلود موقت در کانال خصوصی آرشیو برای دریافت file_id و آزادسازی فوری هارد سرور
+        archive_msg = await callback.message.bot.send_video(
+            chat_id=ARCHIVE_CHANNEL_ID,
+            video=video_to_upload,
             width=compressed_result.width if compressed_result.width > 0 else None,
             height=compressed_result.height if compressed_result.height > 0 else None,
             duration=compressed_result.duration if compressed_result.duration > 0 else None,
+            caption=f"Archive | User: {callback.from_user.id}",
+            parse_mode=None,
+            supports_streaming=True,
+        )
+
+        # استخراج file_id چه تلگرام آن را video ثبت کند و چه برای ویدیوهای بی‌صدا animation ثبت کند
+        uploaded_media = archive_msg.video or archive_msg.animation
+        if not uploaded_media:
+            raise VideoCompressionError("خطا در ثبت فایل ویدیویی در فضای ابری تلگرام.")
+
+        await state.update_data(
+            archive_file_id=uploaded_media.file_id,
+            archive_message_id=archive_msg.message_id,
+            final_caption=final_caption,
+            input_file_path=None,
+        )
+        await state.set_state(VideoCompressorStates.waiting_for_download)
+        compression_succeeded = True
+
+        # تایمر پشتیبان ۱ ساعته برای حذف از کانال آرشیو در صورت عدم دریافت توسط کاربر
+        asyncio.create_task(
+            _delete_single_message_later(
+                bot=callback.message.bot,
+                chat_id=ARCHIVE_CHANNEL_ID,
+                message_id=archive_msg.message_id,
+                delay_seconds=3600,
+            )
+        )
+
+        ready_text = (
+            "✅ **ویدیوی شما با موفقیت فشرده و آماده تحویل شد!**\n\n"
+            f"📦 حجم اولیه: `{format_file_size(original_size)}`\n"
+            f"📉 حجم جدید: `{format_file_size(compressed_size)}` (**{reduction_percent}٪ کاهش حجم**)\n\n"
+            "👇 برای دریافت فایل ویدیویی، دکمه زیر را لمس کنید:"
+        )
+
+        await safe_edit_text(
+            callback.message,
+            ready_text,
+            reply_markup=get_video_download_keyboard(),
+            parse_mode="Markdown",
+        )
+
+    except VideoCompressionError as e:
+        logger.error("خطای تخصصی فشرده‌سازی ویدیو برای کاربر %s: %s", callback.from_user.id, e)
+        await safe_edit_text(callback.message, f"❌ خطای پردازش: {e}", parse_mode=None)
+    except (TelegramBadRequest, TelegramForbiddenError) as e:
+        logger.error("خطای تلگرام حین آپلود ویدیو به کانال آرشیو (%s): %s", ARCHIVE_CHANNEL_ID, e)
+        await safe_edit_text(
+            callback.message,
+            "❌ خطا در آماده‌سازی فایل خروجی در تلگرام. لطفاً از ادمین بودن ربات در کانال آرشیو اطمینان حاصل کنید.",
+            parse_mode=None,
+        )
+    except Exception as e:
+        logger.exception("خطای غیرمنتظره حین پردازش ویدیو: %s", e)
+        await safe_edit_text(
+            callback.message,
+            "❌ متأسفانه در فرآیند تبدیل ویدیو خطایی رخ داد.",
+            parse_mode=None,
+        )
+    finally:
+        # پاک‌سازی قطعی فایل‌های موقت از روی هارد دیسک سرور
+        video_compressor_service.safe_remove(input_path)
+        if compressed_result:
+            video_compressor_service.safe_remove(compressed_result.output_path)
+        if not compression_succeeded:
+            await state.clear()
+
+
+# ==========================================
+# ۵. تحویل آنی ویدیو با کلیک کاربر + تایمر حذف ۲۵ ثانیه‌ای
+# ==========================================
+@router_video_compressor.callback_query(
+    VideoCompressorStates.waiting_for_download,
+    VideoCompressCallback.filter(F.action == "download"),
+)
+async def process_video_download_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    try:
+        await callback.answer("در حال ارسال ویدیو...")
+    except TelegramBadRequest:
+        pass
+
+    data = await state.get_data()
+    archive_file_id = data.get("archive_file_id")
+    archive_message_id = data.get("archive_message_id")
+    final_caption = data.get("final_caption", "🎬 عنوان: دلتا ربات")
+
+    await state.clear()
+
+    if not archive_file_id:
+        await safe_edit_text(
+            callback.message,
+            "❌ لینک دریافت این ویدیو منقضی شده است. لطفاً دوباره ویدیوی خود را ارسال کنید.",
+            reply_markup=None,
+            parse_mode=None,
+        )
+        return
+
+    try:
+        sent_video_msg = await callback.message.answer_video(
+            video=archive_file_id,
             caption=final_caption,
             parse_mode=None,
             supports_streaming=True,
         )
 
-        # ارسال پیام هشدار امنیتی برای حذف خودکار ۲۵ ثانیه‌ای
         warning_msg = await callback.message.answer(
             "⚠️ **هشدار امنیتی و حریم خصوصی:**\n"
             "به دلایل امنیتی، این ویدیو تا **۲۵ ثانیه دیگر** به صورت خودکار از ربات حذف خواهد شد.\n"
@@ -367,43 +489,37 @@ async def process_video_compression(
             parse_mode="Markdown",
         )
 
-        # حذف پیام وضعیت «در حال پردازش...»
         try:
             await callback.message.delete()
         except TelegramBadRequest:
             pass
 
-        # اجرای تسک پس‌زمینه غیرمسدودکننده برای حذف خودکار ویدیو و پیام هشدار پس از ۲۵ ثانیه
         asyncio.create_task(
-            _auto_delete_video_messages(
+            _auto_cleanup_delivered_video(
                 bot=callback.message.bot,
-                chat_id=callback.message.chat.id,
-                message_ids=[sent_video_msg.message_id, warning_msg.message_id],
+                user_chat_id=callback.message.chat.id,
+                user_message_ids=[sent_video_msg.message_id, warning_msg.message_id],
+                archive_chat_id=ARCHIVE_CHANNEL_ID,
+                archive_message_id=archive_message_id,
                 delay_seconds=25,
             )
         )
 
-    except VideoCompressionError as e:
-        logger.error("خطای تخصصی فشرده‌سازی ویدیو برای کاربر %s: %s", callback.from_user.id, e)
-        await safe_edit_text(callback.message, f"❌ خطای پردازش: {e}", parse_mode=None)
-    except TelegramBadRequest as e:
-        logger.error("خطای تلگرام حین ارسال ویدیوی خروجی: %s", e)
+    except (TelegramBadRequest, TelegramForbiddenError) as e:
+        logger.error("خطای تلگرام حین تحویل ویدیو از آرشیو: %s", e)
         await safe_edit_text(
             callback.message,
-            "❌ ارسال ویدیوی فشرده‌شده به تلگرام با خطا مواجه شد.",
+            "❌ متأسفانه فایل منقضی شده یا در دسترس نیست. لطفاً مجدداً ویدیو را ارسال کنید.",
+            reply_markup=None,
             parse_mode=None,
         )
     except Exception as e:
-        logger.exception("خطای غیرمنتظره حین تبدیل یا ارسال ویدیو: %s", e)
+        logger.exception("خطای غیرمنتظره حین تحویل ویدیو به کاربر: %s", e)
         await safe_edit_text(
             callback.message,
-            "❌ متأسفانه در فرآیند تبدیل و ارسال ویدیو خطایی رخ داد.",
+            "❌ خطایی در ارسال ویدیو رخ داد.",
+            reply_markup=None,
             parse_mode=None,
         )
-    finally:
-        # پاک‌سازی قطعی فایل‌های موقت از روی هارد دیسک سرور در هر شرایطی
-        video_compressor_service.safe_remove(input_path)
-        if compressed_result:
-            video_compressor_service.safe_remove(compressed_result.output_path)
-        await state.clear()
 
+        
