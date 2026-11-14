@@ -1,14 +1,11 @@
 import asyncio
-import io
 import logging
 import re
 import unicodedata
 from typing import Tuple
 
-import pymupdf as fitz  # رفع اخطار FutureWarning در نسخه‌های جدید PyMuPDF
-import pytesseract
-from PIL import Image
-from services.ocr import OCRService
+import pymupdf as fitz
+from services.ocr import OCRError, OCRService
 
 logger = logging.getLogger(__name__)
 
@@ -29,18 +26,25 @@ class PDFService:
     # حروف فارسی که فقط در ابتدا یا وسط کلمه می‌آیند و اگر در آخر کلمه باشند نشانه معکوس بودن فونت است
     _STRICT_JOINING_END_CHARS = set("بپتثجچحخسشصضطظعغفقکگلمنئ")
 
+    # کلمات سالم و پرکاربرد فارسی که با حروف غیرچسبان شروع و با حروف چسبان تمام می‌شوند (جلوگیری از تشخیص اشتباه)
+    _COMMON_VALID_WORDS = {
+        "است", "این", "انها", "آنها", "ایران", "ایمنی", "انرژی", "اصول", "امور",
+        "دست", "راست", "دوست", "درست", "رشت", "داشت", "رفت", "گفت", "وقت",
+        "اصل", "اهل", "اول", "دول", "روشن", "امن", "آهن", "آب", "اسب", "ادب",
+        "اسپ", "امید", "آباد", "آزاد", "ارشد", "افراد", "ایجاد", "اسناد", "اعداد",
+    }
+
     def __init__(
         self,
-        ocr_service: OCRService | None = None,
+        ocr_service: OCRService,
         max_pages: int = 1000,
         max_scanned_pages: int = 150,
+        batch_size: int = 10,
     ) -> None:
         self.ocr_service = ocr_service
         self.max_pages = max_pages
         self.max_scanned_pages = max_scanned_pages
-        self.tesseract_lang = "fas+eng"
-        # --oem 1 (موتور شبکه عصبی LSTM) و --psm 3 (تشخیص خودکار صفحات دو ستونه و پاراگراف‌ها)
-        self.tesseract_config = "--oem 1 --psm 3"
+        self.batch_size = batch_size
 
     def _open_document(self, file_bytes: bytes) -> fitz.Document:
         try:
@@ -68,29 +72,44 @@ class PDFService:
     @classmethod
     def _is_garbled_or_reversed_persian(cls, text: str) -> bool:
         """
-        تشخیص اینکه آیا لایه متنی PDF دارای فونت فارسی معکوس (Visual Order) یا به‌هم‌ریخته است.
+        تشخیص دقیق خرابی فونت فارسی در لایه متنی PDF:
+        ۱. کلمات معکوس (Visual Order)
+        ۲. شکستگی حروف وسط کلمات (تک‌حرفی‌های سرگردان مثل 'بهداشت ی')
+        ۳. ترکیب معکوس 'لا' به صورت 'ال' (مثل 'اصطالحات' و 'باال')
         """
         words = re.findall(r"[\u0600-\u06FF]{3,}", text)
         if not words:
             return False
 
+        # الف) بررسی نسبت کلمات آینه‌ای (برعکس) با حذف کلمات سالم پرکاربرد
         reversed_suspects = 0
         non_joiners = set("ادذرزژوآ")
-
         for w in words:
-            # در فارسی استاندارد، کلمات بسیار کمی با د/ر/و/ا شروع و به حروف چسبان مثل ب/ت/س/ط ختم می‌شوند
-            # اما وقتی کلمه برعکس ذخیره شده باشد (مثل "تاحالطصا" به جای "اصطلاحات") این الگو تکرار می‌شود
+            if w in cls._COMMON_VALID_WORDS:
+                continue
             if w[0] in non_joiners and w[-1] in cls._STRICT_JOINING_END_CHARS:
                 reversed_suspects += 1
 
-        ratio = reversed_suspects / len(words)
-        # اگر بیش از ۱۲ درصد کلمات ساختار معکوس داشته باشند، لایه متنی PDF خراب است
-        return ratio > 0.12
+        if (reversed_suspects / len(words)) > 0.08:
+            return True
+
+        # ب) بررسی تک‌حرفی‌های سرگردان فارسی (به جز 'و' ربط) که نشانه شکستگی فونت است
+        isolated_letters = re.findall(r"(?:^|\s)[بپتثجچحخدذرزژسشصضطظعغفقکگلمنهیئ](?:\s|$)", text)
+        if len(isolated_letters) >= 5 and (len(isolated_letters) / len(words)) > 0.04:
+            return True
+
+        # ج) بررسی وجود ترکیب معکوس 'ال' وسط کلمات فارسی (مانند اصطالحات، اسالمی، باال)
+        broken_la = re.findall(r"[\u0600-\u06FF]ال[\u0600-\u06FF]", text)
+        if len(broken_la) >= 2:
+            return True
+
+        return False
 
     def _analyze_pdf_type_sync(self, doc: fitz.Document) -> bool:
         """
-        بررسی می‌کند آیا می‌توان به متن خام PDF اعتماد کرد (True)
-        یا باید صفحات با Tesseract OCR خوانده شوند (False).
+        بررسی سلامت لایه متنی PDF:
+        True = فونت استاندارد و سالم (استخراج مستقیم و رایگان)
+        False = اسکن تصویری یا فونت فارسی شکسته/معکوس (نیازمند OCR دسته‌ای با جمینای)
         """
         sample_pages = min(len(doc), 5)
         sampled_text_parts = []
@@ -103,13 +122,13 @@ class PDFService:
 
         combined_sample = "\n".join(sampled_text_parts)
 
-        # ۱. اگر متن بسیار کم است، فایل اسکن تصویری است -> نیاز به OCR
+        # ۱. اگر متن بسیار کم است، فایل اسکن تصویری است
         if len(combined_sample) <= 50:
             return False
 
-        # ۲. اگر متن دارد اما فونت فارسی آن برعکس یا خراب کدگذاری شده -> نیاز به OCR
+        # ۲. اگر فونت فارسی شکسته یا برعکس است، سوییچ به OCR دسته‌ای
         if self._is_garbled_or_reversed_persian(combined_sample):
-            logger.info("فونت فارسی معکوس/خراب در لایه متنی PDF شناسایی شد. سوییچ خودکار به موتور Tesseract OCR.")
+            logger.info("فونت فارسی شکسته/معکوس شناسایی شد. سوییچ به پردازش دسته‌ای Gemini OCR.")
             return False
 
         return True
@@ -125,6 +144,8 @@ class PDFService:
             "ي": "ی",
             "ى": "ی",
             "ك": "ک",
+            "ة": "ه",
+            "ـ": "",
             "\u200b": "",
             "\u200e": "",
             "\u200f": "",
@@ -141,7 +162,6 @@ class PDFService:
         return "\n".join(cleaned_lines)
 
     def _extract_clean_native_text_sync(self, doc: fitz.Document) -> list[str]:
-        """استخراج سریع برای PDFهایی که لایه متنی کاملاً استاندارد و سالم دارند"""
         results = []
         flags = fitz.TEXT_PRESERVE_WHITESPACE | fitz.TEXT_DEHYPHENATE
         for page_num in range(len(doc)):
@@ -152,24 +172,22 @@ class PDFService:
             results.append(header + (cleaned_text if cleaned_text else "[این صفحه فاقد متن بود]"))
         return results
 
-    def _ocr_single_page_tesseract_sync(self, doc: fitz.Document, page_num: int, matrix: fitz.Matrix) -> str:
-        """رندر یک صفحه در RAM و استخراج متن فارسی/انگلیسی با Tesseract"""
-        page = doc.load_page(page_num)
-        pix = page.get_pixmap(matrix=matrix, alpha=False)
-        img_bytes = pix.tobytes("png")
-        pix = None  # آزادسازی فوری حافظه Pixmap
-
-        with Image.open(io.BytesIO(img_bytes)) as img:
-            gray_img = img.convert("L")
-            ocr_raw = pytesseract.image_to_string(
-                gray_img,
-                lang=self.tesseract_lang,
-                config=self.tesseract_config,
-            )
-
-        del img_bytes
-        cleaned = self._clean_text(ocr_raw)
-        return cleaned if cleaned else "[متنی در این صفحه یافت نشد]"
+    def _render_batch_images_sync(
+        self,
+        doc: fitz.Document,
+        start_idx: int,
+        end_idx: int,
+        matrix: fitz.Matrix,
+    ) -> list[tuple[int, bytes]]:
+        """رندر یک دسته (مثلاً ۱۰ صفحه) به JPEG فشرده در حافظه RAM"""
+        batch_pages: list[tuple[int, bytes]] = []
+        for idx in range(start_idx, end_idx):
+            page = doc.load_page(idx)
+            pix = page.get_pixmap(matrix=matrix, alpha=False)
+            img_bytes = pix.tobytes("jpeg", jpg_quality=82)
+            pix = None
+            batch_pages.append((idx + 1, img_bytes))
+        return batch_pages
 
     async def process_pdf(self, file_bytes: bytes) -> Tuple[str, bool]:
         doc = await asyncio.to_thread(self._open_document, file_bytes)
@@ -181,8 +199,9 @@ class PDFService:
 
             if needs_ocr and total_pages > self.max_scanned_pages:
                 raise PDFPageLimitExceeded(
-                    f"این فایل پی‌دی‌اف نیازمند پردازش تصویری (OCR) است و {total_pages} صفحه دارد.\n"
-                    f"حداکثر سقف مجاز برای این نوع فایل‌ها {self.max_scanned_pages} صفحه است."
+                    f"این فایل پی‌دی‌اف از نوع اسکن‌شده یا دارای فونت غیراستاندارد است و {total_pages} صفحه دارد.\n"
+                    f"حداکثر سقف مجاز برای این نوع فایل‌ها {self.max_scanned_pages} صفحه است "
+                    f"(فایل‌های متنی استاندارد تا {self.max_pages} صفحه پشتیبانی می‌شوند)."
                 )
 
             result_chunks = []
@@ -190,32 +209,48 @@ class PDFService:
             if not needs_ocr:
                 result_chunks = await asyncio.to_thread(self._extract_clean_native_text_sync, doc)
             else:
-                # DPI 180 تعادل عالی بین سرعت روی سرور ضعیف و دقت بالای خواندن فونت فارسی
-                dpi = 180
+                dpi = 140
                 zoom = dpi / 72
                 matrix = fitz.Matrix(zoom, zoom)
+                successful_batches = 0
+                last_ocr_error: OCRError | None = None
 
-                for page_index in range(total_pages):
+                for start_idx in range(0, total_pages, self.batch_size):
+                    end_idx = min(start_idx + self.batch_size, total_pages)
+                    batch_pages: list[tuple[int, bytes]] = []
+
                     try:
-                        page_text = await asyncio.to_thread(
-                            self._ocr_single_page_tesseract_sync,
+                        batch_pages = await asyncio.to_thread(
+                            self._render_batch_images_sync,
                             doc,
-                            page_index,
+                            start_idx,
+                            end_idx,
                             matrix,
                         )
-                        result_chunks.append(f"--- صفحه {page_index + 1} ---\n{page_text}")
-                    except Exception as e:
-                        logger.error(f"خطا در Tesseract OCR صفحه {page_index + 1}: {e}")
+                        batch_text = await self.ocr_service.extract_text_batch(batch_pages)
+                        result_chunks.append(self._clean_text(batch_text))
+                        successful_batches += 1
+                    except OCRError as e:
+                        last_ocr_error = e
+                        logger.warning(f"خطای OCR در صفحات {start_idx + 1} تا {end_idx}: {e}")
                         result_chunks.append(
-                            f"--- صفحه {page_index + 1} ---\n[خطا در استخراج متن این صفحه]"
+                            f"--- صفحات {start_idx + 1} تا {end_idx} ---\n"
+                            f"[خطا در پردازش هوشمند این بخش: {e}]"
                         )
+                    finally:
+                        batch_pages.clear()
 
-                    # تنفس کوتاه به Event Loop تا ربات در حین پردازش صفحات زیاد قفل نکند
-                    await asyncio.sleep(0.05)
+                    if end_idx < total_pages:
+                        await asyncio.sleep(1.0)
+
+                # اگر هیچ دسته‌ای موفق نبود، خطا را به هندلر پاس بده تا سهمیه کاربر نسوزد
+                if successful_batches == 0 and last_ocr_error is not None:
+                    raise last_ocr_error
 
             full_text = "\n\n".join(result_chunks).strip()
             return full_text, needs_ocr
 
         finally:
             doc.close()
+
             
