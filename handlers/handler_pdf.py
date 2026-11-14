@@ -73,13 +73,13 @@ async def start_pdf_process(message: Message, state: FSMContext) -> None:
 
     await state.set_state(PDFState.waiting_for_pdf)
     await message.answer(
-        f"📄 لطفاً فایل PDF مورد نظر خود را ارسال کنید.\n\n"
-        f"📊 سهمیه باقی‌مانده شما: {html.bold(str(remaining))} درخواست "
-        f"(قابل استفاده برای حداکثر {html.bold(str(affordable_pages))} صفحه)\n\n"
-        f"⚠️ قوانین پردازش:\n"
-        f"۱. حداکثر سقف مجاز هر فایل: ۳۰۰ صفحه (حداکثر ۲۰ مگابایت)\n"
-        f"۲. تعرفه مصرف سهمیه: به ازای هر ۱۰۰ صفحه، ۶ سهمیه روزانه (محاسبه دقیق بر اساس تعداد صفحات)\n"
-        f"۳. در صورتی که تعداد صفحات فایل بیشتر از سهمیه فعلی شما باشد، فقط به اندازه سهمیه شما از ابتدای فایل پردازش می‌شود.",
+        f"📄 لطفاً فایل PDF خود را ارسال کنید تا متن آن استخراج شود.\n\n"
+        f"📊 اعتبار فعلی شما: {html.bold(str(remaining))} سهمیه "
+        f"(مناسب برای اسکن تا {html.bold(str(affordable_pages))} صفحه)\n\n"
+        f"📌 راهنما:\n"
+        f"• حداکثر تعداد صفحات قابل پذیرش هر فایل: ۳۰۰ صفحه\n"
+        f"• میزان مصرف اعتبار: به ازای هر ۱۰۰ صفحه، ۶ سهمیه کسر می‌شود (متناسب با تعداد صفحات واقعی فایل).\n"
+        f"• اگر صفحات فایل شما بیشتر از اعتبار فعلی‌تان باشد، ربات به اندازه اعتبار شما از ابتدای فایل را اسکن می‌کند.",
         reply_markup=get_cancel_ocr_keyboard()
     )
 
@@ -120,7 +120,7 @@ async def process_pdf_document(message: Message, state: FSMContext, bot: Bot) ->
 
     if message.document.file_size and message.document.file_size > 20 * 1024 * 1024:
         await message.answer(
-            "❌ حجم فایل بیش از سقف مجاز تلگرام (۲۰ مگابایت) است.\n"
+            "❌ حجم این فایل برای پردازش بیش از حد سنگین است.\n"
             "لطفاً فایل کم‌حجم‌تری ارسال کنید یا دکمه انصراف را بزنید.",
             reply_markup=get_cancel_ocr_keyboard()
         )
@@ -144,7 +144,7 @@ async def process_pdf_document(message: Message, state: FSMContext, bot: Bot) ->
 
         try:
             await status_msg.edit_text(
-                "⏳ در حال استخراج هوشمند محتوا با هوش مصنوعی (در فایل‌های حجیم ممکن است کمی زمان‌بر باشد، لطفاً شکیبا باشید)..."
+                "⏳ در حال استخراج هوشمند محتوا (در فایل‌های چندصفحه‌ای ممکن است کمی زمان‌بر باشد، لطفاً شکیبا باشید)..."
             )
         except TelegramBadRequest:
             pass

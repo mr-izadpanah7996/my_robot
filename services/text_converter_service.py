@@ -48,24 +48,15 @@ class TextToFileService:
         if not name or not name.strip():
             return default
 
-        # حذف کاراکترهای ممنوعه فایل‌سیستم
         cleaned = re.sub(r'[\\/*?:"<>|\x00-\x1f]', "", name).strip()
-        # تبدیل فاصله‌های متوالی و کاراکترهای فاصله‌انداز به آندرلاین
         cleaned = re.sub(r"\s+", "_", cleaned)
         cleaned = cleaned.strip(". ")
 
-        # محدودسازی طول نام به ۶۴ کاراکتر جهت رعایت استانداردهای تلگرام
         return cleaned[:64] if cleaned else default
 
     def create_file(self, text: str, filename: str, format_type: str) -> Path:
         """
         ایجاد فایل نهایی متناسب با نوع فرمت درخواستی.
-        
-        :param text: متن خام دریافتی از کاربر
-        :param filename: نام پایه فایل بدون پسوند
-        :param format_type: فرمت هدف (txt, csv, html, pdf, py, json)
-        :return: شیء Path فایل تولیدشده روی دیسک
-        :raises TextConversionError: در صورت نامعتبر بودن فرمت یا بروز خطای دیسک
         """
         if not text or not text.strip():
             raise TextConversionError("متن ارسالی خالی است و امکان تبدیل وجود ندارد.")
@@ -111,9 +102,6 @@ class TextToFileService:
         return file_path
 
     def _build_csv(self, text: str, base_name: str) -> Path:
-        """
-        تبدیل خطوط متن به ردیف‌های استاندارد CSV همراه با BOM برای اکسل.
-        """
         file_path = self._temp_dir / f"{base_name}.csv"
         lines = text.strip().splitlines()
 
@@ -137,9 +125,6 @@ class TextToFileService:
         return file_path
 
     def _build_html(self, text: str, base_name: str) -> Path:
-        """
-        تولید سند استاندارد HTML5 با پشتیبانی از راست‌چین (RTL) و امنیت در برابر تگ‌های تزریقی.
-        """
         file_path = self._temp_dir / f"{base_name}.html"
 
         escaped_lines = [
@@ -191,10 +176,6 @@ class TextToFileService:
         return file_path
 
     def _build_json(self, text: str, base_name: str) -> Path:
-        """
-        اعتبارسنجی JSON: در صورت معتبر بودن ساختار مرتب می‌شود؛
-        در غیر این صورت در قالب استاندارد و ایمن با پشتیبانی فارسی نگهداری می‌شود.
-        """
         file_path = self._temp_dir / f"{base_name}.json"
         raw_text = text.strip()
 
@@ -212,21 +193,75 @@ class TextToFileService:
         file_path.write_text(formatted_json, encoding="utf-8")
         return file_path
 
+    @staticmethod
+    def _shape_rtl_text(text: str) -> str:
+        """چسباندن حروف فارسی و اعمال الگوریتم دوجهته (RTL) برای رسم در PDF"""
+        reshaped = arabic_reshaper.reshape(text)
+        return get_display(reshaped)
+
+    def _wrap_rtl_paragraph(
+        self,
+        paragraph: str,
+        font_name: str,
+        font_size: int,
+        max_width: float,
+    ) -> list[str]:
+        """
+        شکستن هوشمند پاراگراف فارسی به خطوط متناسب با عرض صفحه A4
+        قبل از اعمال Bidi، تا هیچ کلمه‌ای از صفحه بیرون نزند و ترتیب کلمات حفظ شود.
+        """
+        words = paragraph.split(" ")
+        wrapped_lines: list[str] = []
+        current_words: list[str] = []
+
+        for word in words:
+            if not word:
+                continue
+
+            candidate = " ".join(current_words + [word])
+            shaped_candidate = self._shape_rtl_text(candidate)
+            candidate_width = pdfmetrics.stringWidth(shaped_candidate, font_name, font_size)
+
+            if candidate_width <= max_width:
+                current_words.append(word)
+            else:
+                if current_words:
+                    wrapped_lines.append(" ".join(current_words))
+                    current_words = [word]
+                else:
+                    # شکستن کلمه یا لینک بسیار طولانی که به تنهایی از عرض صفحه بیشتر است
+                    chunk = ""
+                    for ch in word:
+                        test_chunk = chunk + ch
+                        if pdfmetrics.stringWidth(self._shape_rtl_text(test_chunk), font_name, font_size) <= max_width:
+                            chunk = test_chunk
+                        else:
+                            if chunk:
+                                wrapped_lines.append(chunk)
+                            chunk = ch
+                    current_words = [chunk] if chunk else []
+
+        if current_words:
+            wrapped_lines.append(" ".join(current_words))
+
+        return wrapped_lines
+
     def _build_pdf(self, text: str, base_name: str) -> Path:
         """
-        تولید قطعی فایل PDF با فونت استاندارد سیستمی DejaVuSans جهت رفع مربع‌های سیاه.
+        تولید استاندارد فایل PDF فارسی با خط‌بندی دقیق، راست‌چین واقعی و مدیریت چندصفحه‌ای.
         """
         file_path = self._temp_dir / f"{base_name}.pdf"
 
-        # مسیر قطعی فونت سیستمی DejaVuSans
         dejavu_font_path = Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
         font_name = "DejaVuSans"
 
         if dejavu_font_path.exists():
             try:
-                pdfmetrics.registerFont(TTFont(font_name, str(dejavu_font_path)))
+                if font_name not in pdfmetrics.getRegisteredFontNames():
+                    pdfmetrics.registerFont(TTFont(font_name, str(dejavu_font_path)))
             except Exception as e:
                 logger.warning("ثبت فونت DejaVuSans ناموفق بود: %s", e)
+                font_name = "Helvetica"
         else:
             font_name = "Helvetica"
 
@@ -234,37 +269,44 @@ class TextToFileService:
         width, height = A4
 
         font_size = 11
-        try:
-            pdf_canvas.setFont(font_name, font_size)
-        except Exception:
-            pdf_canvas.setFont("Helvetica", font_size)
+        pdf_canvas.setFont(font_name, font_size)
 
-        y = height - 50
+        margin_horizontal = 50
+        margin_vertical = 50
+        max_line_width = width - (2 * margin_horizontal)
+        right_x = width - margin_horizontal
+        y = height - margin_vertical
         line_height = 20
-        margin_x = width - 50
 
-        for raw_line in text.strip().splitlines():
-            line = raw_line.strip()
-            if not line:
-                y -= line_height
+        # پاک‌سازی کاراکترهای کنترلی نامرئی که در فونت DejaVuSans باعث اختلال می‌شوند
+        cleaned_text = text.replace("\u200e", "").replace("\u200f", "").replace("\ufeff", "")
+
+        for raw_paragraph in cleaned_text.splitlines():
+            paragraph = raw_paragraph.strip()
+            if not paragraph:
+                y -= line_height * 0.7
+                if y < margin_vertical:
+                    pdf_canvas.showPage()
+                    pdf_canvas.setFont(font_name, font_size)
+                    y = height - margin_vertical
                 continue
 
-            # ۱. اتصال حروف فارسی و اعمال جهت RTL
-            reshaped_text = arabic_reshaper.reshape(line)
-            bidi_text = get_display(reshaped_text)
+            wrapped_lines = self._wrap_rtl_paragraph(
+                paragraph=paragraph,
+                font_name=font_name,
+                font_size=font_size,
+                max_width=max_line_width,
+            )
 
-            # ۲. مدیریت صفحات جدید در صورت رسیدن به پایین برگه
-            if y < 50:
-                pdf_canvas.showPage()
-                try:
+            for line in wrapped_lines:
+                if y < margin_vertical:
+                    pdf_canvas.showPage()
                     pdf_canvas.setFont(font_name, font_size)
-                except Exception:
-                    pdf_canvas.setFont("Helvetica", font_size)
-                y = height - 50
+                    y = height - margin_vertical
 
-            # ۳. رسم خط با تراز از راست
-            pdf_canvas.drawRightString(margin_x, y, bidi_text)
-            y -= line_height
+                bidi_line = self._shape_rtl_text(line)
+                pdf_canvas.drawRightString(right_x, y, bidi_line)
+                y -= line_height
 
         pdf_canvas.save()
         return file_path
@@ -283,4 +325,5 @@ class TextToFileService:
                 logger.debug("فایل موقت پاک‌سازی شد: %s", target)
         except OSError as e:
             logger.warning("خطا در حذف فایل موقت %s: %s", file_path, e)
+
             
