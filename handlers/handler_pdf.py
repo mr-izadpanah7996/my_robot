@@ -1,4 +1,5 @@
 import io
+import math
 import logging
 from aiogram import Router, F, Bot, html
 from aiogram.types import Message, BufferedInputFile, CallbackQuery
@@ -21,16 +22,29 @@ logger = logging.getLogger(__name__)
 
 pdf_router = Router()
 
-# مقداردهی سرویس‌ها (سقف ۱۰۰۰ صفحه متنی / ۱۵۰ صفحه اسکن‌شده یا دارای فونت غیراستاندارد)
+# مقداردهی سرویس‌ها (سقف ۳۰۰ صفحه - پردازش یکپارچه با Gemini Batch OCR)
 config = load_config()
 ocr_service = OCRService(api_keys=config.ai.api_keys)
 daily_limiter = DailyLimiter(max_requests=15, window_seconds=86400)
 pdf_service = PDFService(
     ocr_service=ocr_service,
-    max_pages=1000,
-    max_scanned_pages=150,
+    max_pages=300,
     batch_size=10,
 )
+
+
+def calculate_affordable_pages(remaining_quota: int) -> int:
+    """محاسبه حداکثر تعداد صفحاتی که کاربر با سهمیه فعلی خود می‌تواند پردازش کند (هر ۱۰۰ صفحه = ۶ سهمیه)"""
+    if remaining_quota <= 0:
+        return 0
+    return (remaining_quota * 100) // 6
+
+
+def calculate_required_quota(pages_count: int) -> int:
+    """محاسبه دقیق سهمیه مصرف‌شده بر اساس تعداد صفحات پردازش‌شده (گرد کردن به بالا)"""
+    if pages_count <= 0:
+        return 0
+    return math.ceil((pages_count * 6) / 100)
 
 
 # ==========================================
@@ -48,21 +62,24 @@ async def start_pdf_process(message: Message, state: FSMContext) -> None:
     user_id = message.from_user.id
     remaining = daily_limiter.get_remaining_quota(user_id=user_id)
 
-    if remaining < 3:
+    if remaining < 1:
         await message.answer(
-            f"⚠️ سهمیه روزانه شما برای این بخش کافی نیست.\n"
-            f"برای پردازش PDF حداقل به ۳ سهمیه نیاز است، اما سهمیه فعلی شما: {html.bold(str(remaining))} است."
+            "⚠️ سهمیه روزانه شما به پایان رسیده است و در حال حاضر امکان پردازش فایل PDF را ندارید.\n"
+            "لطفاً پس از بازنشانی سهمیه روزانه مجدداً تلاش کنید."
         )
         return
+
+    affordable_pages = min(calculate_affordable_pages(remaining), 300)
 
     await state.set_state(PDFState.waiting_for_pdf)
     await message.answer(
         f"📄 لطفاً فایل PDF مورد نظر خود را ارسال کنید.\n\n"
-        f"📊 سهمیه باقی‌مانده شما: {html.bold(str(remaining))} درخواست\n\n"
+        f"📊 سهمیه باقی‌مانده شما: {html.bold(str(remaining))} درخواست "
+        f"(قابل استفاده برای حداکثر {html.bold(str(affordable_pages))} صفحه)\n\n"
         f"⚠️ قوانین پردازش:\n"
-        f"۱. فایل‌های متنی استاندارد: تا ۱۰۰۰ صفحه کاملاً رایگان (بدون کسر سهمیه)\n"
-        f"۲. فایل‌های اسکن‌شده یا دارای فونت غیراستاندارد (پردازش هوشمند): تا ۱۵۰ صفحه با کسر ۳ سهمیه\n"
-        f"۳. حداکثر حجم مجاز فایل: ۲۰ مگابایت",
+        f"۱. حداکثر سقف مجاز هر فایل: ۳۰۰ صفحه (حداکثر ۲۰ مگابایت)\n"
+        f"۲. تعرفه مصرف سهمیه: به ازای هر ۱۰۰ صفحه، ۶ سهمیه روزانه (محاسبه دقیق بر اساس تعداد صفحات)\n"
+        f"۳. در صورتی که تعداد صفحات فایل بیشتر از سهمیه فعلی شما باشد، فقط به اندازه سهمیه شما از ابتدای فایل پردازش می‌شود.",
         reply_markup=get_cancel_ocr_keyboard()
     )
 
@@ -111,11 +128,14 @@ async def process_pdf_document(message: Message, state: FSMContext, bot: Bot) ->
 
     await state.clear()
 
-    if daily_limiter.get_remaining_quota(user_id=user_id) < 3:
+    remaining = daily_limiter.get_remaining_quota(user_id=user_id)
+    if remaining < 1:
         await message.answer("⚠️ سهمیه روزانه شما برای پردازش این فایل کافی نیست.")
         return
 
-    status_msg = await message.answer("⏳ در حال دانلود و ارزیابی لایه‌های فایل PDF...")
+    max_allowed_pages = calculate_affordable_pages(remaining)
+
+    status_msg = await message.answer("⏳ در حال دانلود و آماده‌سازی فایل PDF...")
     file_stream = io.BytesIO()
 
     try:
@@ -124,23 +144,35 @@ async def process_pdf_document(message: Message, state: FSMContext, bot: Bot) ->
 
         try:
             await status_msg.edit_text(
-                "⏳ در حال استخراج محتوا (در فایل‌های اسکن‌شده یا حجیم ممکن است کمی زمان‌بر باشد، لطفاً شکیبا باشید)..."
+                "⏳ در حال استخراج هوشمند محتوا با هوش مصنوعی (در فایل‌های حجیم ممکن است کمی زمان‌بر باشد، لطفاً شکیبا باشید)..."
             )
         except TelegramBadRequest:
             pass
 
-        full_text, needs_ocr = await pdf_service.process_pdf(file_bytes=file_bytes)
+        full_text, processed_pages, total_pages = await pdf_service.process_pdf(
+            file_bytes=file_bytes,
+            max_allowed_pages=max_allowed_pages,
+        )
 
         if not full_text.strip():
             await status_msg.edit_text("⚠️ هیچ متن قابل تشخیصی در این سند یافت نشد.")
             return
 
-        if needs_ocr:
-            for _ in range(3):
-                daily_limiter.check_and_consume(user_id=user_id)
-            usage_notice = "💡 این سند نیازمند پردازش هوشمند (OCR) بود و ۳ سهمیه روزانه کسر گردید."
+        # محاسبه و کسر دقیق سهمیه بر اساس تعداد صفحات واقعی پردازش‌شده
+        used_quota = min(calculate_required_quota(processed_pages), remaining)
+        for _ in range(used_quota):
+            daily_limiter.check_and_consume(user_id=user_id)
+
+        if processed_pages < total_pages:
+            skipped_pages = total_pages - processed_pages
+            usage_notice = (
+                f"💡 به دلیل محدودیت سهمیه روزانه، {processed_pages} صفحه اول از کل {total_pages} صفحه پردازش شد "
+                f"({skipped_pages} صفحه پایانی پردازش نشد) و {used_quota} سهمیه روزانه کسر گردید."
+            )
         else:
-            usage_notice = "💡 این سند دارای لایه متنی استاندارد بود و رایگان (بدون کسر سهمیه) پردازش شد."
+            usage_notice = (
+                f"💡 کل {processed_pages} صفحه فایل با موفقیت پردازش شد و {used_quota} سهمیه روزانه کسر گردید."
+            )
 
         if len(full_text) < 4000:
             try:
@@ -214,4 +246,5 @@ async def invalid_pdf_input(message: Message) -> None:
         "⚠️ لطفاً فقط یک فایل PDF ارسال کنید یا دکمه انصراف را لمس کنید.",
         reply_markup=get_cancel_ocr_keyboard()
     )
+
     
