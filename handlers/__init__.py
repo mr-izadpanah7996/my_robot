@@ -7,7 +7,7 @@ from handlers.handler_audio import router_audio
 from handlers.handler_text_to_file import router_text
 from handlers.audio_compressor_handler import router_audio_compressor
 from handlers.video_compressor_handler import router_video_compressor
-
+from handlers.speech_handler import speech_router
 
 router = Router()
 
@@ -26,6 +26,8 @@ router.include_routers(
     router_audio_compressor,
 
     router_video_compressor,
+
+    speech_router,
 
     describe_router
     
