@@ -1,5 +1,5 @@
 from aiogram.filters.callback_data import CallbackData
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 
@@ -7,7 +7,7 @@ class AudioCompressCallback(CallbackData, prefix="audio_cmp"):
     """
     مدل ساختاریافته داده‌های کلیک روی کیبورد فشرده‌سازی صدا.
     action: 'quality' یا 'cancel'
-    bitrate: '64k' یا '48k' یا '32k' (در صورت انصراف مقدار none می‌گیرد)
+    bitrate: '64k'، '48k'، '32k'، '16k' (در صورت انصراف مقدار none می‌گیرد)
     """
     action: str
     bitrate: str = "none"
@@ -37,14 +37,20 @@ def get_audio_quality_keyboard() -> InlineKeyboardMarkup:
         callback_data=AudioCompressCallback(action="quality", bitrate="32k"),
     )
 
-    # ردیف چهارم: دکمه انصراف و لغو فرآیند
+    # ردیف چهارم: ۱۶ کیلوبیت (حداکثر فشرده‌سازی - مناسب مکالمه و فایل‌های بسیار حجیم)
+    builder.button(
+        text="📉 حداکثر فشرده‌سازی (16 kbps)",
+        callback_data=AudioCompressCallback(action="quality", bitrate="16k"),
+    )
+
+    # ردیف پنجم: دکمه انصراف و لغو فرآیند
     builder.button(
         text="❌ انصراف و لغو",
         callback_data=AudioCompressCallback(action="cancel", bitrate="none"),
     )
 
     # چینش دکمه‌ها: هر گزینه در یک ردیف مجزا برای لمس راحت‌تر در موبایل
-    builder.adjust(1, 1, 1, 1)
+    builder.adjust(1, 1, 1, 1, 1)
 
     return builder.as_markup()
 
