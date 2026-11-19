@@ -11,6 +11,7 @@ from database.db import DatabaseManager
 from handlers import router
 from middlewares.subscription import MandatorySubMiddleware
 from middlewares.throttling import AntiSpamMiddleware
+from middlewares.user_tracker import UserTrackerMiddleware
 
 # ساخت لاگر مخصوص این فایل
 logger = logging.getLogger(__name__)
@@ -47,9 +48,16 @@ async def main() -> None:
 
     dp = Dispatcher()
 
-    # اتصال میدلورها به دیسپچر
+    # ساخت نمونه میدلور ثبت و بروزرسانی خودکار کاربران
+    user_tracker = UserTrackerMiddleware(cache_ttl=300)
+
+    # اتصال میدلورها به دیسپچر (ترتیب اجرا بسیار مهم است)
     dp.message.outer_middleware(AntiSpamMiddleware(limit_seconds=1.0, cooldown_seconds=4.0))
+    dp.message.outer_middleware(user_tracker)
     dp.message.outer_middleware(MandatorySubMiddleware(channels=config.bot.channels))
+
+    # اتصال میدلور ثبت کاربر به دکمه‌های شیشه‌ای
+    dp.callback_query.outer_middleware(user_tracker)
 
     # تزریق شیء کانفیگ و دیتابیس به کل جریان ربات (قابل دسترسی در همه هندلرها و میدلورها)
     dp["config"] = config
