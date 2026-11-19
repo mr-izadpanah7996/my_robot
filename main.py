@@ -7,19 +7,17 @@ from aiogram.client.telegram import TelegramAPIServer
 from aiogram.enums import ParseMode
 
 from config import Config, load_config
+from database.db import DatabaseManager
 from handlers import router
 from middlewares.subscription import MandatorySubMiddleware
 from middlewares.throttling import AntiSpamMiddleware
 
 # ساخت لاگر مخصوص این فایل
-
 logger = logging.getLogger(__name__)
 
 
 async def main() -> None:
-
     # تنظیمات لاگینگ برای نمایش زنده در کنسول/ترمینال با سطح INFO
-
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -28,8 +26,12 @@ async def main() -> None:
     logger.info("در حال خواندن فایل تنظیمات...")
     config: Config = load_config()
 
-    # اتصال به سرور محلی تلگرام در صورت تنظیم آدرس اختصاصی
+    # راه‌اندازی و ساخت جدول‌های دیتابیس هنگام شروع ربات
+    logger.info("در حال آماده‌سازی دیتابیس...")
+    db = DatabaseManager(config.db.path).connect()
+    db.init_tables()
 
+    # اتصال به سرور محلی تلگرام در صورت تنظیم آدرس اختصاصی
     session: AiohttpSession | None = None
     if config.bot.api_server and config.bot.api_server != "https://api.telegram.org":
         logger.info(f"اتصال ربات به سرور محلی تلگرام: {config.bot.api_server}")
@@ -37,7 +39,6 @@ async def main() -> None:
         session = AiohttpSession(api=server)
 
     # ساخت شیء بات با نشست اختصاصی (یا پیش‌فرض)
-
     bot = Bot(
         token=config.bot.token,
         session=session,
@@ -47,23 +48,25 @@ async def main() -> None:
     dp = Dispatcher()
 
     # اتصال میدلورها به دیسپچر
-
     dp.message.outer_middleware(AntiSpamMiddleware(limit_seconds=1.0, cooldown_seconds=4.0))
     dp.message.outer_middleware(MandatorySubMiddleware(channels=config.bot.channels))
 
-    # تزریق شیء کانفیگ به کل جریان ربات (قابل دسترسی در همه هندلرها)
-
+    # تزریق شیء کانفیگ و دیتابیس به کل جریان ربات (قابل دسترسی در همه هندلرها و میدلورها)
     dp["config"] = config
+    dp["db"] = db
 
     dp.include_router(router)
 
     # نادیده گرفتن آپدیت‌هایی که زمان خاموش بودن ربات ارسال شده‌اند
-
-    
     await bot.delete_webhook(drop_pending_updates=True)
 
-    logger.info("ربات با موفقیت روشن شد و در حال دریافت پیام‌ها است.")
-    await dp.start_polling(bot)
+    try:
+        logger.info("ربات با موفقیت روشن شد و در حال دریافت پیام‌ها است.")
+        await dp.start_polling(bot)
+    finally:
+        # بستن ایمن اتصال دیتابیس هنگام خاموش شدن ربات
+        logger.info("در حال بستن اتصال دیتابیس...")
+        db.close()
 
 
 if __name__ == "__main__":
@@ -72,3 +75,4 @@ if __name__ == "__main__":
     except (KeyboardInterrupt, SystemExit):
         logger.info("ربات به صورت دستی توسط ادمین متوقف شد.")
 
+        

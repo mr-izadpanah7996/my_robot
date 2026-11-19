@@ -18,9 +18,15 @@ class AIConfig:
 
 
 @dataclass(slots=True)
+class DatabaseConfig:
+    path: str = "data/delta.db"
+
+
+@dataclass(slots=True)
 class Config:
     bot: BotConfig
     ai: AIConfig
+    db: DatabaseConfig
 
 
 def load_config() -> Config:
@@ -68,6 +74,9 @@ def load_config() -> Config:
 
     video_archive_channel_id = int(archive_channel_raw)
 
+    # مسیر فایل دیتابیس
+    db_path = os.getenv("DB_PATH", "data/delta.db").strip()
+
     return Config(
         bot=BotConfig(
             token=bot_token,
@@ -77,5 +86,6 @@ def load_config() -> Config:
             video_archive_channel_id=video_archive_channel_id,
         ),
         ai=AIConfig(api_keys=api_keys),
+        db=DatabaseConfig(path=db_path),
     )
 
