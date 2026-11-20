@@ -162,6 +162,9 @@ class PDFService:
         success_count = 0
         last_err: OCRError | None = None
 
+        # مکث کوتاه پیش از شروع پردازش تک‌صفحه‌ای برای جلوگیری از Rate Limit لحظه‌ای
+        await asyncio.sleep(1.5)
+
         for page_num, img_bytes in batch_pages:
             try:
                 single_text = await self.ocr_service.extract_text_batch([(page_num, img_bytes)])
@@ -189,7 +192,7 @@ class PDFService:
                 page_results.append(
                     f"--- صفحه {page_num} ---\n[خطا در استخراج متن این صفحه: {e}]"
                 )
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(1.2)
 
         return "\n\n".join(page_results), success_count, last_err
 
@@ -275,7 +278,7 @@ class PDFService:
                     batch_pages.clear()
 
                 if end_idx < pages_to_process:
-                    await asyncio.sleep(0.8)
+                    await asyncio.sleep(1.2)
 
             # اگر هیچ صفحه‌ای با موفقیت پردازش نشد، خطا را به هندلر پاس بده تا سهمیه کسر نشود
             if successful_units == 0 and last_ocr_error is not None:

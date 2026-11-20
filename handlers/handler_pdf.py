@@ -1,50 +1,59 @@
 import io
-import math
 import logging
-from aiogram import Router, F, Bot, html
-from aiogram.types import Message, BufferedInputFile, CallbackQuery
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import StatesGroup, State
+import math
+
+from aiogram import Bot, F, Router, html
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
 from config import load_config
 from keyboards.inline import get_cancel_ocr_keyboard
-from services.ocr import OCRService, OCRError
 from services.limiter import DailyLimiter
+from services.ocr import OCRError, OCRService
 from services.pdf_service import (
-    PDFService,
-    PDFPageLimitExceeded,
-    PDFEncryptedError,
     PDFEmptyError,
+    PDFEncryptedError,
+    PDFPageLimitExceeded,
+    PDFService,
 )
 
 logger = logging.getLogger(__name__)
 
 pdf_router = Router()
 
-# مقداردهی سرویس‌ها (سقف ۳۰۰ صفحه - پردازش یکپارچه با Gemini Batch OCR)
+# مقداردهی سرویس‌ها (سقف ۳۰۰ صفحه - دسته‌های ۴ صفحه‌ای با Fallback تک‌صفحه‌ای)
 config = load_config()
 ocr_service = OCRService(api_keys=config.ai.api_keys)
 daily_limiter = DailyLimiter(max_requests=15, window_seconds=86400)
+
+PAGES_PER_QUOTA = 4
+MAX_PDF_PAGES = 300
+MAX_PDF_FILE_SIZE = 20 * 1024 * 1024  # ۲۰ مگابایت
+
 pdf_service = PDFService(
     ocr_service=ocr_service,
-    max_pages=300,
-    batch_size=10,
+    max_pages=MAX_PDF_PAGES,
+    batch_size=PAGES_PER_QUOTA,
 )
+
+# جلوگیری از پردازش هم‌زمان چند فایل PDF توسط یک کاربر
+_active_pdf_users: set[int] = set()
 
 
 def calculate_affordable_pages(remaining_quota: int) -> int:
-    """محاسبه حداکثر تعداد صفحاتی که کاربر با سهمیه فعلی خود می‌تواند پردازش کند (هر ۱۰۰ صفحه = ۶ سهمیه)"""
+    """محاسبه حداکثر تعداد صفحاتی که کاربر با سهمیه فعلی خود می‌تواند پردازش کند (هر ۱ سهمیه = ۴ صفحه)"""
     if remaining_quota <= 0:
         return 0
-    return (remaining_quota * 100) // 6
+    return remaining_quota * PAGES_PER_QUOTA
 
 
 def calculate_required_quota(pages_count: int) -> int:
     """محاسبه دقیق سهمیه مصرف‌شده بر اساس تعداد صفحات پردازش‌شده (گرد کردن به بالا)"""
     if pages_count <= 0:
         return 0
-    return math.ceil((pages_count * 6) / 100)
+    return math.ceil(pages_count / PAGES_PER_QUOTA)
 
 
 # ==========================================
@@ -59,7 +68,14 @@ class PDFState(StatesGroup):
 # ==========================================
 @pdf_router.message(F.text == "📄 اسکن فایل pdf")
 async def start_pdf_process(message: Message, state: FSMContext) -> None:
+    if not message.from_user:
+        return
+
     user_id = message.from_user.id
+    if user_id in _active_pdf_users:
+        await message.answer("⏳ فایل PDF قبلی شما هنوز در حال اسکن است. لطفاً تا پایان پردازش صبر کنید.")
+        return
+
     remaining = daily_limiter.get_remaining_quota(user_id=user_id)
 
     if remaining < 1:
@@ -69,18 +85,18 @@ async def start_pdf_process(message: Message, state: FSMContext) -> None:
         )
         return
 
-    affordable_pages = min(calculate_affordable_pages(remaining), 300)
+    affordable_pages = min(calculate_affordable_pages(remaining), MAX_PDF_PAGES)
 
     await state.set_state(PDFState.waiting_for_pdf)
     await message.answer(
-        f"📄 لطفاً فایل PDF خود را ارسال کنید تا متن آن استخراج شود.\n\n"
+        f"📄 لطفاً فایل PDF خود را ارسال کنید تا متن آن با دقت بالا استخراج شود.\n\n"
         f"📊 اعتبار فعلی شما: {html.bold(str(remaining))} سهمیه "
         f"(مناسب برای اسکن تا {html.bold(str(affordable_pages))} صفحه)\n\n"
         f"📌 راهنما:\n"
-        f"• حداکثر تعداد صفحات قابل پذیرش هر فایل: ۳۰۰ صفحه\n"
-        f"• میزان مصرف اعتبار: به ازای هر ۱۰۰ صفحه، ۶ سهمیه کسر می‌شود (متناسب با تعداد صفحات واقعی فایل).\n"
-        f"• اگر صفحات فایل شما بیشتر از اعتبار فعلی‌تان باشد، ربات به اندازه اعتبار شما از ابتدای فایل را اسکن می‌کند.",
-        reply_markup=get_cancel_ocr_keyboard()
+        f"• حداکثر تعداد صفحات مجاز هر فایل: {MAX_PDF_PAGES} صفحه (حداکثر حجم: ۲۰ مگابایت)\n"
+        f"• میزان مصرف اعتبار: به ازای هر {PAGES_PER_QUOTA} صفحه، ۱ سهمیه کسر می‌شود (متناسب با تعداد صفحات پردازش‌شده).\n"
+        f"• اگر تعداد صفحات فایل شما بیشتر از اعتبار فعلی‌تان باشد، ربات به اندازه اعتبار شما از ابتدای فایل را اسکن می‌کند.",
+        reply_markup=get_cancel_ocr_keyboard(),
     )
 
 
@@ -92,10 +108,11 @@ async def cancel_pdf_process(callback: CallbackQuery, state: FSMContext) -> None
     current_state = await state.get_state()
     if current_state is not None:
         await state.clear()
-        try:
-            await callback.message.edit_text("❌ عملیات اسکن فایل PDF لغو شد.")
-        except TelegramBadRequest:
-            pass
+        if callback.message:
+            try:
+                await callback.message.edit_text("❌ عملیات اسکن فایل PDF لغو شد.")
+            except TelegramBadRequest:
+                pass
 
     try:
         await callback.answer()
@@ -108,21 +125,27 @@ async def cancel_pdf_process(callback: CallbackQuery, state: FSMContext) -> None
 # ==========================================
 @pdf_router.message(PDFState.waiting_for_pdf, F.document)
 async def process_pdf_document(message: Message, state: FSMContext, bot: Bot) -> None:
+    if not message.from_user or not message.document:
+        return
+
     user_id = message.from_user.id
+    if user_id in _active_pdf_users:
+        await message.answer("⏳ فایل قبلی شما هنوز در حال پردازش است. لطفاً کمی شکیبا باشید.")
+        return
 
     file_name = message.document.file_name or "document.pdf"
     if not file_name.lower().endswith(".pdf"):
         await message.answer(
             "❌ فرمت فایل نامعتبر است! لطفاً فقط فایل با پسوند PDF ارسال کنید.",
-            reply_markup=get_cancel_ocr_keyboard()
+            reply_markup=get_cancel_ocr_keyboard(),
         )
         return
 
-    if message.document.file_size and message.document.file_size > 20 * 1024 * 1024:
+    if message.document.file_size and message.document.file_size > MAX_PDF_FILE_SIZE:
         await message.answer(
-            "❌ حجم این فایل برای پردازش بیش از حد سنگین است.\n"
+            "❌ حجم این فایل بیشتر از سقف مجاز (۲۰ مگابایت) است.\n"
             "لطفاً فایل کم‌حجم‌تری ارسال کنید یا دکمه انصراف را بزنید.",
-            reply_markup=get_cancel_ocr_keyboard()
+            reply_markup=get_cancel_ocr_keyboard(),
         )
         return
 
@@ -135,6 +158,7 @@ async def process_pdf_document(message: Message, state: FSMContext, bot: Bot) ->
 
     max_allowed_pages = calculate_affordable_pages(remaining)
 
+    _active_pdf_users.add(user_id)
     status_msg = await message.answer("⏳ در حال دانلود و آماده‌سازی فایل PDF...")
     file_stream = io.BytesIO()
 
@@ -144,7 +168,8 @@ async def process_pdf_document(message: Message, state: FSMContext, bot: Bot) ->
 
         try:
             await status_msg.edit_text(
-                "⏳ در حال استخراج هوشمند محتوا (در فایل‌های چندصفحه‌ای ممکن است کمی زمان‌بر باشد، لطفاً شکیبا باشید)..."
+                "⏳ در حال اسکن و استخراج هوشمند صفحات...\n"
+                "(در فایل‌های چندصفحه‌ای برای حفظ دقت متن ممکن است کمی زمان‌بر باشد، لطفاً شکیبا باشید)"
             )
         except TelegramBadRequest:
             pass
@@ -166,15 +191,15 @@ async def process_pdf_document(message: Message, state: FSMContext, bot: Bot) ->
         if processed_pages < total_pages:
             skipped_pages = total_pages - processed_pages
             usage_notice = (
-                f"💡 به دلیل محدودیت سهمیه روزانه، {processed_pages} صفحه اول از کل {total_pages} صفحه پردازش شد "
+                f"💡 به دلیل محدودیت سهمیه روزانه، {processed_pages} صفحه اول از کل {total_pages} صفحه اسکن شد "
                 f"({skipped_pages} صفحه پایانی پردازش نشد) و {used_quota} سهمیه روزانه کسر گردید."
             )
         else:
             usage_notice = (
-                f"💡 کل {processed_pages} صفحه فایل با موفقیت پردازش شد و {used_quota} سهمیه روزانه کسر گردید."
+                f"💡 کل {processed_pages} صفحه فایل با موفقیت اسکن شد و {used_quota} سهمیه روزانه کسر گردید."
             )
 
-        if len(full_text) < 4000:
+        if len(full_text) < 3800:
             try:
                 await status_msg.delete()
             except TelegramBadRequest:
@@ -191,9 +216,10 @@ async def process_pdf_document(message: Message, state: FSMContext, bot: Bot) ->
                 file=full_text.encode("utf-8"),
                 filename=f"Extracted_{clean_name}.txt",
             )
+            caption_text = f"✅ متن استخراج‌شده فایل پی‌دی‌اف\n\n{usage_notice}"[:1024]
             await message.reply_document(
                 document=output_file,
-                caption=f"✅ متن استخراج‌شده فایل پی‌دی‌اف\n\n{usage_notice}",
+                caption=caption_text,
             )
             try:
                 await status_msg.delete()
@@ -234,6 +260,7 @@ async def process_pdf_document(message: Message, state: FSMContext, bot: Bot) ->
             await message.reply("❌ متأسفانه در فرآیند استخراج متن PDF خطایی رخ داد.")
 
     finally:
+        _active_pdf_users.discard(user_id)
         file_stream.close()
 
 
@@ -244,7 +271,7 @@ async def process_pdf_document(message: Message, state: FSMContext, bot: Bot) ->
 async def invalid_pdf_input(message: Message) -> None:
     await message.reply(
         "⚠️ لطفاً فقط یک فایل PDF ارسال کنید یا دکمه انصراف را لمس کنید.",
-        reply_markup=get_cancel_ocr_keyboard()
+        reply_markup=get_cancel_ocr_keyboard(),
     )
 
     
