@@ -15,10 +15,10 @@ class AudioCompressionError(Exception):
 
 class AudioCompressorService:
     """
-    سرویس فشرده‌سازی و تغییر بیت‌ریت فایل‌های صوتی تا سقف ۱۰۰ مگابایت با ابزار ffmpeg.
-    - پشتیبانی از بیت‌ریت‌های 16k، 32k، 48k و 64k با تنظیم هوشمند کانال و نرخ نمونه‌برداری
+    سرویس فشرده‌سازی حرفه‌ای فایل‌های صوتی تا سقف ۱۰۰ مگابایت با ابزار ffmpeg.
+    - بهینه‌سازی ویژه بیت‌ریت‌های پایین (16k و 32k) با انکودینگ مونو، فیلتر شفافیت، نرمال‌سازی صدا و بالاترین دقت LAME
+    - پشتیبانی از بیت‌ریت‌های 16k، 32k، 48k و 64k
     - سازگار با Local Bot API و حالت استاندارد
-    - مجهز به کنترل همزمانی (Semaphore)، بررسی فضای دیسک، تایم‌اوت و پاک‌سازی ضدزامبی
     """
 
     MAX_FILE_SIZE_BYTES = 100 * 1024 * 1024  # سقف ۱۰۰ مگابایت
@@ -40,7 +40,7 @@ class AudioCompressorService:
         self._temp_dir = Path(temp_dir)
         self._process_timeout = process_timeout
         self._ensure_temp_dir()
-        self.cleanup_stale_files(max_age_seconds=7200)
+        self.cleanup_stale_files(max_age_seconds=3600)
 
     def _ensure_temp_dir(self) -> None:
         """اطمینان از وجود پوشه موقت و دسترسی مجاز روی سرور"""
@@ -55,7 +55,7 @@ class AudioCompressorService:
         self._ensure_temp_dir()
         return self._temp_dir
 
-    def cleanup_stale_files(self, max_age_seconds: int = 7200) -> None:
+    def cleanup_stale_files(self, max_age_seconds: int = 3600) -> None:
         """پاک‌سازی فایل‌های موقت قدیمی باقی‌مانده از نشست‌ها یا ری‌استارت‌های قبلی"""
         if not self._temp_dir.exists():
             return
@@ -73,7 +73,6 @@ class AudioCompressorService:
         """بررسی وجود فضای کافی در دیسک پیش از پردازش فایل‌های حجیم"""
         try:
             usage = shutil.disk_usage(self._temp_dir)
-            # نیاز به حداقل ۳ برابر حجم فایل ورودی (ورودی + خروجی + حاشیه امن سیستم)
             if usage.free < required_bytes * 3:
                 logger.critical(
                     "کمبود فضای دیسک در %s: فضای آزاد %s بایت، مورد نیاز %s بایت",
@@ -119,6 +118,9 @@ class AudioCompressorService:
         try:
             await asyncio.to_thread(shutil.copy2, src, dest_path)
             return dest_path
+        except asyncio.CancelledError:
+            await self.async_safe_remove(dest_path)
+            raise
         except OSError as e:
             await self.async_safe_remove(dest_path)
             logger.error("خطا در انتقال فایل محلی %s به پوشه موقت: %s", src, e)
@@ -131,7 +133,7 @@ class AudioCompressorService:
         bot_title: str = "دلتا ربات",
     ) -> Path:
         """
-        فشرده‌سازی فایل صوتی ورودی به فرمت MP3 با بیت‌ریت انتخابی و اعمال متادیتای اختصاصی عنوان.
+        فشرده‌سازی فایل صوتی ورودی با بالاترین شفافیت ممکن در بیت‌ریت انتخابی.
 
         :param input_path: مسیر فایل صوتی روی دیسک
         :param bitrate: کیفیت مورد نظر ('16k', '32k', '48k', '64k')
@@ -161,13 +163,23 @@ class AudioCompressorService:
         unique_id = uuid.uuid4().hex[:8]
         output_path = self._temp_dir / f"compressed_{unique_id}.mp3"
 
-        # تنظیم بهینه کانال و نرخ نمونه‌برداری متناسب با بیت‌ریت برای حداکثر شفافیت صدا
+        # تنظیم مهندسی کانال، نرخ نمونه‌برداری و زنجیره فیلتر صوتی بر اساس بیت‌ریت
         if clean_bitrate == "16k":
             audio_channels = "1"
-            sample_rate = "22050"
-        else:
+            sample_rate = "16000"
+            audio_filter = "highpass=f=90,lowpass=f=6800,dynaudnorm=f=150:g=15"
+        elif clean_bitrate == "32k":
+            audio_channels = "1"
+            sample_rate = "24000"
+            audio_filter = "highpass=f=70,lowpass=f=10000,dynaudnorm=f=150:g=15"
+        elif clean_bitrate == "48k":
+            audio_channels = "2"
+            sample_rate = "32000"
+            audio_filter = None
+        else:  # 64k
             audio_channels = "2"
             sample_rate = "44100"
+            audio_filter = None
 
         resolved_input = str(in_file.resolve())
         resolved_output = str(output_path.resolve())
@@ -181,18 +193,27 @@ class AudioCompressorService:
             "-vn",                        # حذف استریم ویدیو یا کاور آلبوم
             "-map", "0:a:0",              # انتخاب قطعی اولین استریم صوتی فایل
             "-map_metadata", "-1",        # پاک‌سازی متادیتاهای سنگین فایل اصلی
+        ]
+
+        if audio_filter:
+            cmd.extend(["-af", audio_filter])
+
+        cmd.extend([
             "-c:a", "libmp3lame",
             "-b:a", clean_bitrate,
+            "-compression_level", "0",    # بالاترین دقت مدل روان‌آکوستیک LAME بدون افزایش حجم
             "-ac", audio_channels,
             "-ar", sample_rate,
             "-metadata", f"title={bot_title}",
             resolved_output,
-        ]
+        ])
 
         logger.info(
-            "درخواست فشرده‌سازی برای فایل %s با بیت‌ریت %s در صف سمافور قرار گرفت.",
+            "درخواست فشرده‌سازی برای فایل %s با بیت‌ریت %s (کانال: %s، نرخ: %s) در صف سمافور قرار گرفت.",
             in_file.name,
             clean_bitrate,
+            audio_channels,
+            sample_rate,
         )
 
         process = None
