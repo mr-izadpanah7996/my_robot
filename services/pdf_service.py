@@ -84,6 +84,21 @@ class PDFService:
         return "\n".join(cleaned_lines)
 
     @staticmethod
+    def _has_repetition_loop(text: str) -> bool:
+        """
+        تشخیص گیر کردن مدل در حلقه تکرار (مانند تکرار پی‌درپی یک عبارت بیش از ۵ بار)
+        """
+        if not text:
+            return False
+        # هر عبارت ۳ تا ۶۰ کاراکتری (غیر از خط تیره یا نقطه) که ۶ بار یا بیشتر پشت سر هم تکرار شود
+        return bool(re.search(r"([^\s.\-_]{2,}.{0,58}?)\1{5,}", text))
+
+    @staticmethod
+    def _collapse_repetitions(text: str) -> str:
+        """پاک‌سازی اضطراری حلقه‌های تکرار در صورت تکرار مجدد پس از تلاش دوم"""
+        return re.sub(r"([^\s.\-_]{2,}.{0,58}?)\1{4,}", r"\1", text)
+
+    @staticmethod
     def _render_batch_images_sync(
         doc: fitz.Document,
         start_idx: int,
@@ -101,22 +116,39 @@ class PDFService:
         return batch_pages
 
     @staticmethod
-    def _has_missing_pages(batch_text: str, expected_page_numbers: list[int]) -> bool:
+    def _has_missing_or_empty_pages(batch_text: str, expected_page_numbers: list[int]) -> bool:
         """
-        بررسی می‌کند آیا مدل در پاسخ دسته‌ای، صفحه‌ای را بی‌صدا جا انداخته است یا خیر.
-        اگر بیش از ۱ صفحه در دسته باشد و شماره صفحات مورد انتظار در خروجی پیدا نشود، True برمی‌گرداند.
+        بررسی می‌کند آیا در خروجی دسته‌ای:
+        ۱. صفحه‌ای اصلاً وجود ندارد
+        ۲. یا هدر صفحه وجود دارد اما زیر آن هیچ متنی استخراج نشده است (مانند صفحه ۱۴۹)
         """
         if len(expected_page_numbers) <= 1:
             return False
 
-        # تبدیل ارقام فارسی/عربی به انگلیسی برای جستجوی دقیق شماره صفحات
         trans_table = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
         normalized_text = batch_text.translate(trans_table)
 
+        # یافتن موقعیت شروع هدر هر صفحه
+        header_matches = list(
+            re.finditer(r"(?m)^[^\n]*صفحه\s*(\d+)[^\n]*$", normalized_text)
+        )
+        found_pages: dict[int, tuple[int, int]] = {}
+        for i, match in enumerate(header_matches):
+            p_num = int(match.group(1))
+            content_start = match.end()
+            content_end = header_matches[i + 1].start() if i + 1 < len(header_matches) else len(normalized_text)
+            if p_num not in found_pages:
+                found_pages[p_num] = (content_start, content_end)
+
         for page_num in expected_page_numbers:
-            # بررسی وجود هدر صفحه (مثل: --- صفحه 12 --- یا صفحه 12)
-            if not re.search(rf"صفحه\s*{page_num}\b", normalized_text):
+            if page_num not in found_pages:
                 return True
+            start_pos, end_pos = found_pages[page_num]
+            page_body = normalized_text[start_pos:end_pos].strip()
+            # اگر زیر هدر صفحه کمتر از ۳ کاراکتر متن باشد، مشکوک به جا افتادن است
+            if len(page_body) < 3:
+                return True
+
         return False
 
     async def _process_pages_individually(
@@ -124,7 +156,7 @@ class PDFService:
         batch_pages: list[tuple[int, bytes]],
     ) -> tuple[str, int, OCRError | None]:
         """
-        مکانیزم Fallback: پردازش تک‌صفحه‌ای در صورت شکست یا ناقص بودن خروجی دسته‌ای
+        مکانیزم Fallback: پردازش تک‌صفحه‌ای در صورت شکست، ناقص بودن یا حلقه تکرار در خروجی دسته‌ای
         """
         page_results: list[str] = []
         success_count = 0
@@ -135,8 +167,18 @@ class PDFService:
                 single_text = await self.ocr_service.extract_text_batch([(page_num, img_bytes)])
                 cleaned = self._clean_text(single_text)
 
+                # اگر در حالت تک‌صفحه‌ای هم مدل دچار حلقه تکرار شد، یک بار دیگر تلاش کن
+                if self._has_repetition_loop(cleaned):
+                    logger.warning("تشخیص حلقه تکرار در صفحه %s؛ تلاش مجدد...", page_num)
+                    await asyncio.sleep(1.0)
+                    retry_text = await self.ocr_service.extract_text_batch([(page_num, img_bytes)])
+                    cleaned = self._clean_text(retry_text)
+                    if self._has_repetition_loop(cleaned):
+                        cleaned = self._collapse_repetitions(cleaned)
+
                 # اطمینان از وجود هدر شماره صفحه در خروجی
-                if not re.search(rf"صفحه\s*{page_num}", cleaned):
+                trans_table = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+                if not re.search(rf"صفحه\s*{page_num}\b", cleaned.translate(trans_table)):
                     cleaned = f"--- صفحه {page_num} ---\n{cleaned}"
 
                 page_results.append(cleaned)
@@ -197,10 +239,14 @@ class PDFService:
                         batch_text = await self.ocr_service.extract_text_batch(batch_pages)
                         cleaned_batch = self._clean_text(batch_text)
 
-                        # اگر مدل صفحه‌ای را در خروجی دسته‌ای جا انداخته بود، به حالت تک‌صفحه‌ای برو
-                        if self._has_missing_pages(cleaned_batch, expected_pages):
+                        has_loop = self._has_repetition_loop(cleaned_batch)
+                        has_missing = self._has_missing_or_empty_pages(cleaned_batch, expected_pages)
+
+                        if has_loop or has_missing:
+                            reason = "حلقه تکرار" if has_loop else "صفحه جاافتاده یا خالی"
                             logger.warning(
-                                "ناقص بودن خروجی دسته‌ای در صفحات %s تا %s؛ سوییچ به پردازش تک‌صفحه‌ای.",
+                                "تشخیص %s در صفحات %s تا %s؛ سوییچ به پردازش تک‌صفحه‌ای.",
+                                reason,
                                 start_idx + 1,
                                 end_idx,
                             )
@@ -241,5 +287,4 @@ class PDFService:
         finally:
             doc.close()
 
-
-
+            
