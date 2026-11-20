@@ -86,7 +86,7 @@ async def check_membership_callback(callback: CallbackQuery, bot: Bot, config: C
 
     # ارسال تاییدیه همراه با منوی اصلی
     await callback.message.answer(
-        "✅ عضویت شما تایید شد! حالا می‌توانید از خدمات ربات استفاده کنید:",
+        "✅ عضویت شما تایید شد! لطفا ربات را /start استارت کنید: ",
         reply_markup=get_main_menu()
     )
     await callback.answer()

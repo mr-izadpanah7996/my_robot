@@ -9,11 +9,14 @@ from handlers.audio_compressor_handler import router_audio_compressor
 from handlers.video_compressor_handler import router_video_compressor
 from handlers.speech_handler import speech_router
 from handlers.tts_handler import tts_router
-
+from handlers.admin import admin_router
 
 router = Router()
 
 router.include_routers(
+
+    admin_router,
+    
 
     start_router,
 
