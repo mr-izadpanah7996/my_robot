@@ -19,6 +19,10 @@ def get_main_menu() -> ReplyKeyboardMarkup:
             KeyboardButton(text="🎧 تبدیل ویس به متن"),
             KeyboardButton(text="🗣 تبدیل متن به ویس"),
         ],
+        [
+            KeyboardButton(text="📱 اسکن و ساخت QR"),
+            KeyboardButton(text="🗜 زیپ کردن فایل‌ها"),
+        ],
     ]
 
     return ReplyKeyboardMarkup(
@@ -27,3 +31,4 @@ def get_main_menu() -> ReplyKeyboardMarkup:
         one_time_keyboard=True,
         input_field_placeholder="یک گزینه را انتخاب کنید..."
     )
+

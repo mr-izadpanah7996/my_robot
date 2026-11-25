@@ -10,6 +10,8 @@ from handlers.video_compressor_handler import router_video_compressor
 from handlers.speech_handler import speech_router
 from handlers.tts_handler import tts_router
 from handlers.admin import admin_router
+from handlers.qr_handler import qr_router
+
 
 router = Router()
 
@@ -25,6 +27,8 @@ router.include_routers(
     pdf_router,
 
     router_audio,
+
+    qr_router,
 
     router_text,
 
