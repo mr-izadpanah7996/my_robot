@@ -11,7 +11,7 @@ from handlers.speech_handler import speech_router
 from handlers.tts_handler import tts_router
 from handlers.admin import admin_router
 from handlers.qr_handler import qr_router
-
+from handlers.zip_handler import zip_router
 
 router = Router()
 
@@ -39,6 +39,8 @@ router.include_routers(
     speech_router,
 
     tts_router,
+
+    zip_router,
 
     describe_router
     
